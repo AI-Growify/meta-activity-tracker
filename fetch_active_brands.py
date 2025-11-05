@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
+import sys
 
 load_dotenv()
 
@@ -636,29 +637,56 @@ class MetaActivityTrackerWithAirtable:
 
 # ============ MAIN ============
 if __name__ == "__main__":
+    
+    # Get environment variables
     META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
     AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
     AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
     AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME")
-    GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
+    GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "google_credentials.json")
     GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 
+    # Validate required variables
     if not all([META_ACCESS_TOKEN, AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
         print("❌ Missing required environment variables!")
-        exit(1)
+        sys.exit(1)
     
-    tracker = MetaActivityTrackerWithAirtable(
-        meta_access_token=META_ACCESS_TOKEN,
-        airtable_token=AIRTABLE_TOKEN,
-        airtable_base_id=AIRTABLE_BASE_ID,
-        airtable_table_name=AIRTABLE_TABLE_NAME,
-        google_credentials_path=GOOGLE_CREDENTIALS_PATH,
-        google_spreadsheet_id=GOOGLE_SPREADSHEET_ID,
-        max_workers=5
-    )
+    # Get hours from command line or environment (for GitHub Actions flexibility)
+    hours = int(os.getenv("FETCH_HOURS", "12"))
+    if len(sys.argv) > 1:
+        try:
+            hours = int(sys.argv[1])
+        except ValueError:
+            print(f"⚠️ Invalid hours argument, using default: {hours}")
     
-    results = tracker.run(hours=112, append_mode=True, save_csv=False)
+    print(f"\n{'='*80}")
+    print(f"🚀 STARTING META ACTIVITY TRACKER")
+    print(f"   Hours to fetch: {hours}")
+    print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*80}\n")
     
-    print("\n" + "="*80)
-    print("DONE! 🎉")
-    print("="*80)
+    try:
+        tracker = MetaActivityTrackerWithAirtable(
+            meta_access_token=META_ACCESS_TOKEN,
+            airtable_token=AIRTABLE_TOKEN,
+            airtable_base_id=AIRTABLE_BASE_ID,
+            airtable_table_name=AIRTABLE_TABLE_NAME,
+            google_credentials_path=GOOGLE_CREDENTIALS_PATH,
+            google_spreadsheet_id=GOOGLE_SPREADSHEET_ID,
+            max_workers=5
+        )
+        
+        results = tracker.run(hours=hours, append_mode=True, save_csv=False)
+        
+        print("\n" + "="*80)
+        print("✅ DONE! 🎉")
+        print(f"   Activities processed: {len(results)}")
+        print("="*80)
+        
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
