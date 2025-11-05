@@ -1,1 +1,133 @@
+name: Meta Activity Tracker
 
+on:
+  # Runs every 12 hours at 00:00 and 12:00 UTC
+  schedule:
+    - cron: '0 */12 * * *'
+  
+  # Allows manual triggering from GitHub UI
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Hours to fetch (default: 12)'
+        required: false
+        default: '12'
+        type: number
+
+# Set permissions
+permissions:
+  contents: read
+
+jobs:
+  fetch-meta-activities:
+    name: Fetch Meta Activities
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    # Step 1: Checkout code
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+    
+    # Step 2: Setup Python
+    - name: 🐍 Setup Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    # Step 3: Install dependencies
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    # Step 4: Create Google credentials file
+    - name: 🔐 Setup Google Credentials
+      env:
+        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+      run: |
+        echo "$GOOGLE_CREDENTIALS" > google_credentials.json
+        echo "✅ Google credentials file created"
+    
+    # Step 5: Calculate hours since last run (smart fetching)
+    - name: 📊 Calculate Fetch Window
+      id: calc_hours
+      run: |
+        # Use manual input if provided, otherwise use 12 hours
+        HOURS=${{ github.event.inputs.hours || '12' }}
+        
+        # Add 1 hour buffer to prevent gaps
+        HOURS_WITH_BUFFER=$((HOURS + 1))
+        
+        echo "hours=$HOURS_WITH_BUFFER" >> $GITHUB_OUTPUT
+        echo "📅 Will fetch activities from last $HOURS_WITH_BUFFER hours"
+    
+    # Step 6: Run the tracker
+    - name: 🚀 Run Meta Activity Tracker
+      env:
+        META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+        AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+        AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+        GOOGLE_CREDENTIALS_PATH: ./google_credentials.json
+        GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+        FETCH_HOURS: ${{ steps.calc_hours.outputs.hours }}
+      run: |
+        echo "🔄 Starting Meta Activity Tracker..."
+        echo "⏰ Fetch window: $FETCH_HOURS hours"
+        
+        python fetch_active_brands.py
+        
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 0 ]; then
+          echo "✅ Tracker completed successfully"
+        else
+          echo "❌ Tracker failed with exit code $EXIT_CODE"
+          exit $EXIT_CODE
+        fi
+    
+    # Step 7: Update run tracking
+    - name: 📝 Update Run Statistics
+      if: success()
+      run: |
+        echo "✅ Run completed at $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+        echo "📊 Next run in 12 hours"
+    
+    # Step 8: Upload logs on failure
+    - name: 📤 Upload Failure Logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: failure-logs-${{ github.run_number }}
+        path: |
+          *.log
+          *.csv
+        retention-days: 7
+    
+    # Step 9: Clean up credentials
+    - name: 🧹 Cleanup
+      if: always()
+      run: |
+        rm -f google_credentials.json
+        echo "✅ Cleanup completed"
+    
+    # Step 10: Send notification on failure
+    - name: 📧 Send Failure Notification
+      if: failure()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 587
+        username: ${{ secrets.EMAIL_USERNAME }}
+        password: ${{ secrets.EMAIL_PASSWORD }}
+        subject: "❌ Meta Activity Tracker Failed - Run #${{ github.run_number }}"
+        to: ${{ secrets.NOTIFICATION_EMAIL }}
+        from: Meta Activity Tracker
+        body: |
+          The Meta Activity Tracker workflow failed.
+          
+          Run Number: ${{ github.run_number }}
+          Time: ${{ github.event.head_commit.timestamp }}
+          
+          Check logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
