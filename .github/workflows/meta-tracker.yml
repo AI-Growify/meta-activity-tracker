@@ -1,15 +1,12 @@
 name: Meta Activity Tracker
 
 on:
-  # Runs every 12 hours at 00:00 and 12:00 UTC
   schedule:
     - cron: '0 */12 * * *'
-  
-  # Manual trigger
   workflow_dispatch:
     inputs:
       hours:
-        description: 'Hours to fetch'
+        description: 'Hours to fetch (leave blank for smart auto-detect)'
         required: false
         default: '12'
         type: number
@@ -24,10 +21,10 @@ jobs:
     timeout-minutes: 30
     
     steps:
-    - name: 📥 Checkout Repository
+    - name: 📥 Checkout
       uses: actions/checkout@v4
     
-    - name: 🐍 Setup Python 3.11
+    - name: 🐍 Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
@@ -39,50 +36,50 @@ jobs:
         pip install -r requirements.txt
     
     - name: 🔐 Setup Google Credentials
-      env:
-        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
       run: |
-        echo "$GOOGLE_CREDENTIALS" > google_credentials.json
-        echo "✅ Google credentials created"
+        echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > google_credentials.json
     
-    - name: 📊 Calculate Fetch Window
-      id: calc_hours
+    - name: 🚀 Run Tracker with Smart Fetch
       run: |
+        export META_ACCESS_TOKEN="${{ secrets.META_ACCESS_TOKEN }}"
+        export AIRTABLE_TOKEN="${{ secrets.AIRTABLE_TOKEN }}"
+        export AIRTABLE_BASE_ID="${{ secrets.AIRTABLE_BASE_ID }}"
+        export AIRTABLE_TABLE_NAME="${{ secrets.AIRTABLE_TABLE_NAME }}"
+        export GOOGLE_CREDENTIALS_PATH="./google_credentials.json"
+        export GOOGLE_SPREADSHEET_ID="${{ secrets.GOOGLE_SPREADSHEET_ID }}"
+        export GITHUB_RUN_NUMBER="${{ github.run_number }}"
+        
         HOURS=${{ github.event.inputs.hours || '12' }}
-        HOURS_WITH_BUFFER=$((HOURS + 1))
-        echo "hours=$HOURS_WITH_BUFFER" >> $GITHUB_OUTPUT
-        echo "📅 Fetching last $HOURS_WITH_BUFFER hours"
-    
-    - name: 🚀 Run Meta Activity Tracker
-      env:
-        META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-        AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-        AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-        AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
-        GOOGLE_CREDENTIALS_PATH: ./google_credentials.json
-        GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
-        FETCH_HOURS: ${{ steps.calc_hours.outputs.hours }}
-      run: |
-        echo "🔄 Starting tracker..."
-        python fetch_active_brands.py $FETCH_HOURS
-        if [ $? -eq 0 ]; then
-          echo "✅ Success!"
+        
+        echo "════════════════════════════════════════════════════════════════"
+        echo "🚀 META ACTIVITY TRACKER - RUN #${{ github.run_number }}"
+        echo "════════════════════════════════════════════════════════════════"
+        echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "📋 Initial fetch window: ${HOURS} hours"
+        echo "🔍 Smart fetch: Will auto-adjust based on last entry"
+        echo "════════════════════════════════════════════════════════════════"
+        
+        python fetch_active_brands.py $HOURS
+        
+        EXIT_CODE=$?
+        echo ""
+        echo "════════════════════════════════════════════════════════════════"
+        if [ $EXIT_CODE -eq 0 ]; then
+          echo "✅ TRACKER COMPLETED SUCCESSFULLY"
+          echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "📊 Check Google Sheet for updated data"
         else
-          echo "❌ Failed!"
-          exit 1
+          echo "❌ TRACKER FAILED"
         fi
-    
-    - name: 📝 Log Success
-      if: success()
-      run: |
-        echo "✅ Completed at $(date -u)"
-        echo "📊 Next run in 12 hours"
+        echo "════════════════════════════════════════════════════════════════"
+        
+        exit $EXIT_CODE
     
     - name: 📤 Upload Logs on Failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: logs-${{ github.run_number }}
+        name: failure-logs-run-${{ github.run_number }}
         path: |
           *.log
           *.csv
