@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
-import sys
 
 load_dotenv()
 
@@ -49,7 +48,7 @@ class MetaActivityTrackerWithAirtable:
         
         self.max_workers = max_workers
         self.brand_mapping_df = None
-        self.brand_mapping_dict = {}  # For fuzzy matching
+        self.brand_mapping_dict = {}
 
     def _create_session_with_retries(self):
         session = requests.Session()
@@ -73,16 +72,13 @@ class MetaActivityTrackerWithAirtable:
             print(f"⚠️ API request failed: {e}")
             return None
 
-    # ============ FUZZY BRAND MATCHING ============
     def _normalize_brand_name(self, name):
         """Normalize brand name for matching"""
         if pd.isna(name) or not name:
             return ''
         
-        # Convert to lowercase and strip
         name = str(name).lower().strip()
         
-        # Remove common suffixes/variations
         remove_terms = [
             'pvt ltd', 'private limited', 'pvt. ltd.', 'private ltd',
             'llp', 'opc', 'limited', 'ltd', 'inc', 'corp',
@@ -93,7 +89,6 @@ class MetaActivityTrackerWithAirtable:
         for term in remove_terms:
             name = name.replace(term, '')
         
-        # Remove extra spaces and special characters
         name = ' '.join(name.split())
         name = ''.join(c for c in name if c.isalnum() or c.isspace())
         
@@ -106,24 +101,18 @@ class MetaActivityTrackerWithAirtable:
         
         normalized_input = self._normalize_brand_name(brand_name)
         
-        # First, try exact match on normalized names
         if normalized_input in self.brand_mapping_dict:
             return self.brand_mapping_dict[normalized_input]
         
-        # Second, try partial matching
-        # Check if input contains any Airtable brand or vice versa
         for airtable_brand_normalized, mapping_data in self.brand_mapping_dict.items():
-            # Check if one contains the other
             if (normalized_input in airtable_brand_normalized or 
                 airtable_brand_normalized in normalized_input):
                 
-                # Prefer longer match (more specific)
                 if len(normalized_input) >= 5 and len(airtable_brand_normalized) >= 5:
                     return mapping_data
         
         return None
 
-    # ============ AIRTABLE ============
     def fetch_airtable_data(self):
         """Fetch all brand/manager mapping data from Airtable"""
         print("\n" + "="*80)
@@ -166,7 +155,6 @@ class MetaActivityTrackerWithAirtable:
         
         return df
 
-    # ============ META API ============
     def get_all_ad_accounts(self):
         """Get all Meta ad accounts"""
         url = f"{self.meta_base_url}/me/adaccounts"
@@ -358,7 +346,6 @@ class MetaActivityTrackerWithAirtable:
         
         return df
 
-    # ============ IMPROVED MAPPING LOGIC ============
     def map_airtable_to_activities(self, activities_df):
         """Map Airtable brand data to Meta activities with fuzzy matching"""
         print("\n" + "="*80)
@@ -373,7 +360,6 @@ class MetaActivityTrackerWithAirtable:
             print("⚠️ No Airtable data available for mapping")
             return activities_df
         
-        # Find column names
         possible_brand_cols = ['Brand', 'Brands', 'Brand Name', 'brand', 'brands']
         possible_fb_manager_cols = ['FB Manager', 'FB_Manager', 'Facebook Manager', 'fb_manager']
         possible_brand_manager_cols = ['Brand Manager', 'Brand_Manager', 'brand_manager']
@@ -394,7 +380,6 @@ class MetaActivityTrackerWithAirtable:
             print("❌ Could not find Brand column in Airtable data!")
             return activities_df
         
-        # Build fuzzy matching dictionary
         print("\n   Building fuzzy matching dictionary...")
         for _, row in self.brand_mapping_df.iterrows():
             brand_name = str(row[brand_col]).strip() if pd.notna(row[brand_col]) else ''
@@ -410,7 +395,6 @@ class MetaActivityTrackerWithAirtable:
         
         print(f"   Created {len(self.brand_mapping_dict)} normalized brand mappings")
         
-        # Apply fuzzy matching
         def map_brand_data(brand_name):
             match = self._find_best_brand_match(brand_name)
             if match:
@@ -432,10 +416,8 @@ class MetaActivityTrackerWithAirtable:
         mapping_results = activities_df['Brand'].apply(map_brand_data)
         activities_df = pd.concat([activities_df, mapping_results], axis=1)
         
-        # Add fetch timestamp
         activities_df['Fetch_Date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        # Stats
         mapped_count = activities_df[activities_df['FB_Manager'] != 'Unknown'].shape[0]
         unmapped_count = activities_df[activities_df['FB_Manager'] == 'Unknown'].shape[0]
         
@@ -450,7 +432,6 @@ class MetaActivityTrackerWithAirtable:
             if len(unmapped_brands) > 15:
                 print(f"      ... and {len(unmapped_brands) - 15} more")
         
-        # Reorder columns
         column_order = [
             'Brand', 'Matched_Airtable_Brand', 'FB_Manager', 'Brand_Manager', 'Current_Team',
             'Account_ID', 'Account_Name', 'Actor', 'Action',
@@ -463,7 +444,85 @@ class MetaActivityTrackerWithAirtable:
         
         return activities_df
 
-    # ============ GOOGLE SHEETS ============
+    # ============ NEW METHOD 1: SMART FETCH ============
+    def get_last_entry_time_from_sheet(self):
+        """Get the most recent timestamp from existing Google Sheet data"""
+        if self.gspread_client is None:
+            return None
+        
+        try:
+            sh = self.gspread_client.open_by_key(self.google_spreadsheet_id)
+            ws = sh.worksheet('Meta_Activities_Log')
+            
+            data = ws.get_all_records()
+            if not data:
+                print("ℹ️ No existing data in sheet")
+                return None
+            
+            df = pd.DataFrame(data)
+            
+            if 'Timestamp' not in df.columns:
+                print("⚠️ No Timestamp column found")
+                return None
+            
+            df = df[df['Timestamp'].notna() & (df['Timestamp'] != '')]
+            if df.empty:
+                print("⚠️ No valid timestamps found")
+                return None
+            
+            df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+            df = df.dropna(subset=['Timestamp_dt'])
+            
+            if df.empty:
+                return None
+            
+            last_timestamp = df['Timestamp_dt'].max()
+            print(f"📅 Last entry in sheet: {last_timestamp}")
+            return last_timestamp
+            
+        except Exception as e:
+            print(f"⚠️ Could not read last entry time: {e}")
+            return None
+
+    # ============ NEW METHOD 2: ACTIVITY LOGGER ============
+    def log_github_activity(self, action, details):
+        """Log activities to GitHub Actions Log sheet"""
+        if self.gspread_client is None:
+            return
+        
+        try:
+            sh = self.gspread_client.open_by_key(self.google_spreadsheet_id)
+            
+            try:
+                ws = sh.worksheet('GitHub_Actions_Log')
+            except:
+                ws = sh.add_worksheet(title='GitHub_Actions_Log', rows=1000, cols=10)
+                ws.append_row([
+                    'Timestamp', 'Run Number', 'Action', 'Details', 
+                    'Activities Count', 'Time Range', 'Status'
+                ])
+                ws.format('1:1', {
+                    'textFormat': {'bold': True, 'fontSize': 11},
+                    'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.2},
+                    'horizontalAlignment': 'CENTER'
+                })
+            
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            run_number = os.getenv('GITHUB_RUN_NUMBER', 'manual')
+            
+            ws.append_row([
+                timestamp,
+                run_number,
+                action,
+                details,
+                '',
+                '',
+                '✅ Success' if 'Success' in action or 'Completed' in action else '🔄 In Progress'
+            ])
+            
+        except Exception as e:
+            print(f"⚠️ Could not log to GitHub Actions sheet: {e}")
+
     def setup_google_sheets(self):
         if not (self.google_credentials_path and os.path.exists(self.google_credentials_path)):
             return None
@@ -514,6 +573,8 @@ class MetaActivityTrackerWithAirtable:
         print(f"UPLOADING TO GOOGLE SHEETS")
         print(f"{'='*80}")
         
+        new_activities_count = 0
+        
         try:
             sh = self.gspread_client.open_by_key(self.google_spreadsheet_id)
             
@@ -521,11 +582,9 @@ class MetaActivityTrackerWithAirtable:
                 existing_df = self.read_existing_data_from_sheets(sheet_name)
                 
                 if not existing_df.empty:
-                    # FIXED: Create unique ID for deduplication
                     def create_unique_id(row):
                         return f"{row['Account_ID']}_{row['Object_Name']}_{row['Timestamp']}_{row['Action']}"
                     
-                    # Add unique ID to both dataframes
                     existing_df['_unique_id'] = existing_df.apply(create_unique_id, axis=1)
                     df['_unique_id'] = df.apply(create_unique_id, axis=1)
                     
@@ -533,30 +592,32 @@ class MetaActivityTrackerWithAirtable:
                     print(f"   - Existing: {len(existing_df)} rows")
                     print(f"   - New fetch: {len(df)} rows")
                     
-                    # Find truly new activities
                     existing_ids = set(existing_df['_unique_id'])
                     new_df = df[~df['_unique_id'].isin(existing_ids)].copy()
+                    new_activities_count = len(new_df)
                     
-                    print(f"   - Truly new activities: {len(new_df)} rows")
+                    print(f"   - Truly new activities: {new_activities_count} rows")
                     
                     if len(new_df) > 0:
-                        # Combine: keep all existing + only new ones
                         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                        
-                        # Remove the helper column
                         combined_df = combined_df.drop('_unique_id', axis=1)
-                        
-                        # Sort by timestamp
                         combined_df = combined_df.sort_values('Timestamp', ascending=False)
-                        
                         print(f"   - Final total: {len(combined_df)} rows")
                         df = combined_df
+                        
+                        # Log new activities
+                        if new_activities_count > 0:
+                            newest_timestamp = new_df['Timestamp'].max()
+                            oldest_timestamp = new_df['Timestamp'].min()
+                            self.log_github_activity(
+                                f'➕ Added {new_activities_count} New Activities',
+                                f'Range: {oldest_timestamp} to {newest_timestamp}'
+                            )
                     else:
                         print(f"   ℹ️ No new activities to add. Keeping existing data.")
                         existing_df = existing_df.drop('_unique_id', axis=1)
                         df = existing_df
             
-            # Create or get worksheet
             try:
                 ws = sh.worksheet(sheet_name)
                 ws.clear()
@@ -569,10 +630,8 @@ class MetaActivityTrackerWithAirtable:
                 )
                 print(f"✅ Created new sheet '{sheet_name}'")
             
-            # Upload
             set_with_dataframe(ws, df, include_index=False, include_column_header=True)
             
-            # Format header
             ws.format('1:1', {
                 'textFormat': {'bold': True, 'fontSize': 11},
                 'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.2},
@@ -582,37 +641,76 @@ class MetaActivityTrackerWithAirtable:
             ws.freeze(rows=1)
             
             print(f"✅ Uploaded {len(df)} activities to '{sheet_name}'")
+            if new_activities_count > 0:
+                print(f"   📊 {new_activities_count} NEW activities added")
             print(f"🔗 https://docs.google.com/spreadsheets/d/{self.google_spreadsheet_id}")
             
         except Exception as e:
             print(f"❌ Upload failed: {e}")
 
-    # ============ MAIN PIPELINE ============
+    # ============ UPDATED run() METHOD ============
     def run(self, hours=24, append_mode=False, save_csv=False):
-        """Main execution pipeline"""
+        """Main execution pipeline with smart fetching"""
+        start_time = time.time()
+        
         print("="*80)
         print("META ACTIVITY TRACKER WITH AIRTABLE MAPPING")
         print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Tracking last {hours} hours")
+        print(f"Initial hours parameter: {hours}")
         print(f"Mode: {'APPEND' if append_mode else 'REPLACE'}")
         print("="*80)
+        
+        # SMART FETCH: Calculate actual hours needed
+        if append_mode:
+            last_entry_time = self.get_last_entry_time_from_sheet()
+            
+            if last_entry_time:
+                now = datetime.now()
+                hours_since_last = (now - last_entry_time).total_seconds() / 3600
+                adjusted_hours = int(hours_since_last) + 2
+                
+                print(f"\n🔍 SMART FETCH CALCULATION:")
+                print(f"   Last entry time: {last_entry_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"   Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"   Hours since last entry: {hours_since_last:.2f}")
+                print(f"   Adjusted fetch window: {adjusted_hours} hours (with 2h buffer)")
+                print("="*80 + "\n")
+                
+                hours = adjusted_hours
+                
+                self.log_github_activity(
+                    '🔍 Smart Fetch Calculated',
+                    f'Last: {last_entry_time.strftime("%Y-%m-%d %H:%M:%S")}, '
+                    f'Gap: {hours_since_last:.1f}h, Fetching: {adjusted_hours}h'
+                )
+            else:
+                print(f"\nℹ️ No previous data found, using default: {hours} hours\n")
+                self.log_github_activity('📋 First Run', f'Fetching last {hours} hours')
+        
+        self.log_github_activity('🚀 Tracker Started', f'Fetching last {hours} hours')
         
         self.brand_mapping_df = self.fetch_airtable_data()
         activities_df = self.fetch_meta_activities(hours=hours)
         
         if activities_df.empty:
             print("\n✅ Process complete - no activities found")
+            self.log_github_activity('ℹ️ No New Activities', f'No activities in last {hours}h')
             return activities_df
         
         final_df = self.map_airtable_to_activities(activities_df)
         
-        # Summary
+        if 'Timestamp' in final_df.columns:
+            time_range = f"{final_df['Timestamp'].min()} to {final_df['Timestamp'].max()}"
+        else:
+            time_range = 'N/A'
+        
         print("\n" + "="*80)
         print("ACTIVITY SUMMARY")
         print("="*80)
         print(f"Total activities: {len(final_df)}")
         print(f"Unique brands: {final_df['Brand'].nunique()}")
         print(f"Unique actors: {final_df['Actor'].nunique()}")
+        print(f"Time range: {time_range}")
         
         print("\n📊 Top 10 Most Active Brands:")
         print(final_df['Brand'].value_counts().head(10))
@@ -631,6 +729,11 @@ class MetaActivityTrackerWithAirtable:
         
         if self.gspread_client:
             self.upload_to_sheets(final_df, append_mode=append_mode)
+            duration = (time.time() - start_time) / 60
+            self.log_github_activity(
+                '✅ Tracker Completed',
+                f'{len(final_df)} activities in {duration:.1f}min. Range: {time_range}'
+            )
         
         return final_df
 
@@ -699,7 +802,7 @@ if __name__ == "__main__":
             max_workers=5
         )
         
-        # Run tracker
+        # Run tracker with SMART FETCH enabled (append_mode=True)
         results = tracker.run(hours=hours, append_mode=True, save_csv=False)
         
         # Success summary
