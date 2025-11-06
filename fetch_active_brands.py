@@ -637,6 +637,11 @@ class MetaActivityTrackerWithAirtable:
 
 # ============ MAIN ============
 if __name__ == "__main__":
+    import sys
+    
+    print("\n" + "="*80)
+    print("🚀 META ACTIVITY TRACKER - GITHUB ACTIONS")
+    print("="*80)
     
     # Get environment variables
     META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
@@ -647,25 +652,43 @@ if __name__ == "__main__":
     GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 
     # Validate required variables
-    if not all([META_ACCESS_TOKEN, AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
-        print("❌ Missing required environment variables!")
+    missing_vars = []
+    if not META_ACCESS_TOKEN:
+        missing_vars.append("META_ACCESS_TOKEN")
+    if not AIRTABLE_TOKEN:
+        missing_vars.append("AIRTABLE_TOKEN")
+    if not AIRTABLE_BASE_ID:
+        missing_vars.append("AIRTABLE_BASE_ID")
+    if not AIRTABLE_TABLE_NAME:
+        missing_vars.append("AIRTABLE_TABLE_NAME")
+    if not GOOGLE_SPREADSHEET_ID:
+        missing_vars.append("GOOGLE_SPREADSHEET_ID")
+    
+    if missing_vars:
+        print("❌ Missing required environment variables:")
+        for var in missing_vars:
+            print(f"   - {var}")
+        print("\n💡 Make sure all GitHub Secrets are added!")
         sys.exit(1)
     
-    # Get hours from command line or environment (for GitHub Actions flexibility)
-    hours = int(os.getenv("FETCH_HOURS", "12"))
+    # Get hours from command line or default
+    hours = 12
     if len(sys.argv) > 1:
         try:
             hours = int(sys.argv[1])
         except ValueError:
-            print(f"⚠️ Invalid hours argument, using default: {hours}")
+            print(f"⚠️ Invalid hours argument, using default: 12")
+            hours = 12
     
-    print(f"\n{'='*80}")
-    print(f"🚀 STARTING META ACTIVITY TRACKER")
+    print(f"\n📋 Configuration:")
     print(f"   Hours to fetch: {hours}")
     print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*80}\n")
+    print(f"   Credentials: {GOOGLE_CREDENTIALS_PATH}")
+    print(f"   Sheet ID: {GOOGLE_SPREADSHEET_ID[:20]}...")
+    print("="*80 + "\n")
     
     try:
+        # Create tracker instance
         tracker = MetaActivityTrackerWithAirtable(
             meta_access_token=META_ACCESS_TOKEN,
             airtable_token=AIRTABLE_TOKEN,
@@ -676,17 +699,27 @@ if __name__ == "__main__":
             max_workers=5
         )
         
+        # Run tracker
         results = tracker.run(hours=hours, append_mode=True, save_csv=False)
         
+        # Success summary
         print("\n" + "="*80)
-        print("✅ DONE! 🎉")
-        print(f"   Activities processed: {len(results)}")
+        print("✅ TRACKER COMPLETED SUCCESSFULLY! 🎉")
         print("="*80)
+        print(f"   Activities processed: {len(results)}")
+        print(f"   Unique brands: {results['Brand'].nunique() if not results.empty else 0}")
+        print(f"   Data saved to Google Sheets")
+        print("="*80 + "\n")
         
         sys.exit(0)
         
     except Exception as e:
-        print(f"\n❌ FATAL ERROR: {e}")
+        print("\n" + "="*80)
+        print("❌ TRACKER FAILED")
+        print("="*80)
+        print(f"Error: {str(e)}")
+        print("\nFull traceback:")
         import traceback
         traceback.print_exc()
+        print("="*80 + "\n")
         sys.exit(1)
