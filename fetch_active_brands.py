@@ -18,29 +18,8 @@ from gspread_dataframe import set_with_dataframe
 load_dotenv()
 
 
-class EnhancedMetaActivityTracker:
-    """Enhanced Meta activity tracker with detailed activity breakdown and filtering"""
-    
-    # Activities to EXCLUDE (Meta's automated actions)
-    EXCLUDED_EVENT_TYPES = {
-        'ad_account_update_spend_limit',
-        'ad_account_reset_spend_limit',
-        'ad_account_billing_charge',
-        'ad_account_billing_charge_failed',
-        'ad_account_billing_decline',
-        'ad_review_approved',
-        'ad_review_declined',
-        'automatic_placement_optimization',
-        'campaign_budget_optimization',
-        'auto_bid_adjustment',
-        'delivery_insights_notification'
-    }
-    
-    # Human-initiated activities we WANT
-    INCLUDED_ACTIONS = {
-        'create', 'update', 'delete', 'pause', 'resume', 'archive',
-        'edit', 'change', 'modify', 'activate', 'deactivate'
-    }
+class MetaActivityTrackerWithAirtable:
+    """Meta activity tracker with Airtable brand/manager mapping"""
     
     def __init__(self,
                  meta_access_token,
@@ -92,27 +71,6 @@ class EnhancedMetaActivityTracker:
         except Exception as e:
             print(f"⚠️ API request failed: {e}")
             return None
-
-    def _is_human_activity(self, activity):
-        """Filter to include only human-initiated activities"""
-        event_type = activity.get('event_type', '').lower()
-        translated_event = activity.get('translated_event_type', '').lower()
-        
-        # Exclude Meta's automated activities
-        if event_type in self.EXCLUDED_EVENT_TYPES:
-            return False
-        
-        # Check if it's a human action
-        for action in self.INCLUDED_ACTIONS:
-            if action in event_type or action in translated_event:
-                return True
-        
-        # Include if actor_name exists (human actor)
-        actor = activity.get('actor_name', '')
-        if actor and actor.lower() not in ['meta', 'facebook', 'system', 'automated']:
-            return True
-        
-        return False
 
     def _normalize_brand_name(self, name):
         """Normalize brand name for matching"""
@@ -235,7 +193,7 @@ class EnhancedMetaActivityTracker:
             'access_token': self.meta_access_token,
             'since': since_iso,
             'limit': 500,
-            'fields': 'event_type,event_time,actor_name,object_name,object_type,object_id,translated_event_type,extra_data'
+            'fields': 'event_type,event_time,actor_name,object_name,object_type,object_id,translated_event_type'
         }
         
         activities = []
@@ -244,10 +202,7 @@ class EnhancedMetaActivityTracker:
             if not data or 'data' not in data:
                 break
             
-            # Filter for human activities only
-            raw_activities = data.get('data', [])
-            human_activities = [act for act in raw_activities if self._is_human_activity(act)]
-            activities.extend(human_activities)
+            activities.extend(data.get('data', []))
             
             paging = data.get('paging', {})
             next_url = paging.get('next')
@@ -259,105 +214,35 @@ class EnhancedMetaActivityTracker:
         
         return activities
 
-    def get_campaign_details(self, campaign_id):
-        """Get detailed campaign information"""
-        url = f"{self.meta_base_url}/{campaign_id}"
+    def get_campaigns_for_account(self, ad_account_id):
+        """Get campaigns to extract brand info"""
+        url = f"{self.meta_base_url}/{ad_account_id}/campaigns"
         params = {
             'access_token': self.meta_access_token,
-            'fields': 'id,name,status,effective_status,objective,created_time,updated_time,start_time,stop_time,daily_budget,lifetime_budget,budget_remaining,bid_strategy,special_ad_categories,source_campaign_id'
+            'fields': 'id,name,status,effective_status,objective,created_time,updated_time',
+            'limit': 500
         }
         
-        data = self._make_api_request(url, params)
-        return data if data else {}
-
-    def get_adset_details(self, adset_id):
-        """Get detailed ad set information"""
-        url = f"{self.meta_base_url}/{adset_id}"
-        params = {
-            'access_token': self.meta_access_token,
-            'fields': 'id,name,status,effective_status,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_amount,targeting,start_time,end_time,created_time,updated_time'
-        }
-        
-        data = self._make_api_request(url, params)
-        return data if data else {}
-
-    def get_ad_details(self, ad_id):
-        """Get detailed ad information"""
-        url = f"{self.meta_base_url}/{ad_id}"
-        params = {
-            'access_token': self.meta_access_token,
-            'fields': 'id,name,status,effective_status,creative,created_time,updated_time,preview_shareable_link'
-        }
-        
-        data = self._make_api_request(url, params)
-        return data if data else {}
-
-    def _extract_targeting_info(self, targeting):
-        """Extract readable targeting information"""
-        if not targeting or not isinstance(targeting, dict):
-            return 'Not Available', 'Not Available', 'Not Available'
-        
-        # Age
-        age_min = targeting.get('age_min', 'N/A')
-        age_max = targeting.get('age_max', 'N/A')
-        age_range = f"{age_min}-{age_max}" if age_min != 'N/A' else 'Not Set'
-        
-        # Gender
-        genders = targeting.get('genders', [])
-        if not genders:
-            gender = 'All'
-        elif 1 in genders and 2 in genders:
-            gender = 'All'
-        elif 1 in genders:
-            gender = 'Male'
-        elif 2 in genders:
-            gender = 'Female'
-        else:
-            gender = 'Not Set'
-        
-        # Locations
-        geo_locations = targeting.get('geo_locations', {})
-        countries = geo_locations.get('countries', [])
-        cities = geo_locations.get('cities', [])
-        regions = geo_locations.get('regions', [])
-        
-        if countries:
-            location = ', '.join(countries[:3])
-            if len(countries) > 3:
-                location += f' +{len(countries)-3} more'
-        elif cities:
-            location = f"{len(cities)} cities"
-        elif regions:
-            location = f"{len(regions)} regions"
-        else:
-            location = 'Not Set'
-        
-        return age_range, gender, location
-
-    def _parse_extra_data(self, extra_data):
-        """Parse extra_data JSON to extract change details"""
-        if not extra_data:
-            return 'N/A', 'N/A'
-        
-        try:
-            if isinstance(extra_data, str):
-                extra_data = json.loads(extra_data)
+        campaigns = []
+        while True:
+            data = self._make_api_request(url, params)
+            if not data or 'data' not in data:
+                break
             
-            old_value = extra_data.get('old_value', 'N/A')
-            new_value = extra_data.get('new_value', 'N/A')
+            campaigns.extend(data.get('data', []))
             
-            # Format values nicely
-            if isinstance(old_value, dict):
-                old_value = json.dumps(old_value, indent=2)
-            if isinstance(new_value, dict):
-                new_value = json.dumps(new_value, indent=2)
-            
-            return str(old_value), str(new_value)
-        except:
-            return 'N/A', 'N/A'
+            paging = data.get('paging', {})
+            next_url = paging.get('next')
+            if not next_url:
+                break
+            url = next_url
+            params = {}
+            time.sleep(0.03)
+        
+        return campaigns
 
     def _process_account(self, account, hours=24):
-        """Process one account - get activities with enhanced details"""
+        """Process one account - get activities and basic info"""
         account_id = account.get('id')
         account_name = account.get('name', 'Unknown')
         business_name = account.get('business_name', '')
@@ -369,83 +254,27 @@ class EnhancedMetaActivityTracker:
         if not activities:
             return []
         
+        campaigns = self.get_campaigns_for_account(account_id) or []
+        campaign_lookup = {c['id']: c for c in campaigns}
+        
         results = []
         for activity in activities:
             object_id = activity.get('object_id', '')
             object_name = activity.get('object_name', '')
             object_type = activity.get('object_type', '')
-            extra_data = activity.get('extra_data', {})
             
-            # Initialize all fields
-            campaign_name = object_name
-            campaign_status = 'N/A'
-            campaign_objective = 'N/A'
-            campaign_budget_type = 'N/A'
-            campaign_budget_amount = 'N/A'
-            campaign_bid_strategy = 'N/A'
+            campaign_name = ''
+            campaign_status = ''
+            campaign_objective = ''
             
-            adset_name = 'N/A'
-            adset_status = 'N/A'
-            adset_optimization_goal = 'N/A'
-            adset_billing_event = 'N/A'
-            age_targeting = 'N/A'
-            gender_targeting = 'N/A'
-            location_targeting = 'N/A'
+            if object_type == 'campaign' and object_id in campaign_lookup:
+                camp = campaign_lookup[object_id]
+                campaign_name = camp.get('name', object_name)
+                campaign_status = camp.get('effective_status', camp.get('status', ''))
+                campaign_objective = camp.get('objective', '')
+            else:
+                campaign_name = object_name
             
-            ad_name = 'N/A'
-            ad_status = 'N/A'
-            ad_preview_link = 'N/A'
-            
-            change_from = 'N/A'
-            change_to = 'N/A'
-            
-            # Fetch details based on object type
-            if object_type == 'campaign':
-                campaign_details = self.get_campaign_details(object_id)
-                if campaign_details:
-                    campaign_name = campaign_details.get('name', object_name)
-                    campaign_status = campaign_details.get('effective_status', campaign_details.get('status', 'N/A'))
-                    campaign_objective = campaign_details.get('objective', 'N/A')
-                    campaign_bid_strategy = campaign_details.get('bid_strategy', 'N/A')
-                    
-                    daily_budget = campaign_details.get('daily_budget')
-                    lifetime_budget = campaign_details.get('lifetime_budget')
-                    
-                    if daily_budget:
-                        campaign_budget_type = 'Daily'
-                        campaign_budget_amount = f"${float(daily_budget)/100:.2f}"
-                    elif lifetime_budget:
-                        campaign_budget_type = 'Lifetime'
-                        campaign_budget_amount = f"${float(lifetime_budget)/100:.2f}"
-                    
-                    time.sleep(0.05)
-            
-            elif object_type == 'adset':
-                adset_details = self.get_adset_details(object_id)
-                if adset_details:
-                    adset_name = adset_details.get('name', object_name)
-                    adset_status = adset_details.get('effective_status', adset_details.get('status', 'N/A'))
-                    adset_optimization_goal = adset_details.get('optimization_goal', 'N/A')
-                    adset_billing_event = adset_details.get('billing_event', 'N/A')
-                    
-                    targeting = adset_details.get('targeting', {})
-                    age_targeting, gender_targeting, location_targeting = self._extract_targeting_info(targeting)
-                    
-                    time.sleep(0.05)
-            
-            elif object_type == 'ad':
-                ad_details = self.get_ad_details(object_id)
-                if ad_details:
-                    ad_name = ad_details.get('name', object_name)
-                    ad_status = ad_details.get('effective_status', ad_details.get('status', 'N/A'))
-                    ad_preview_link = ad_details.get('preview_shareable_link', 'N/A')
-                    
-                    time.sleep(0.05)
-            
-            # Parse extra_data for change details
-            change_from, change_to = self._parse_extra_data(extra_data)
-            
-            # Parse timestamp
             timestamp = activity.get('event_time', '')
             timestamp_parsed = ''
             if timestamp:
@@ -456,44 +285,16 @@ class EnhancedMetaActivityTracker:
                     timestamp_parsed = timestamp
             
             results.append({
-                # Brand & Account Info
                 'Brand': brand,
                 'Account_ID': account_id,
                 'Account_Name': account_name,
-                
-                # Activity Info
                 'Actor': activity.get('actor_name', 'Unknown'),
                 'Action': activity.get('translated_event_type', activity.get('event_type', 'Unknown')),
-                'Action_Type': object_type.upper(),
-                'Timestamp': timestamp_parsed,
-                
-                # Campaign Details
-                'Campaign_Name': campaign_name,
+                'Object_Name': campaign_name,
+                'Object_Type': object_type,
                 'Campaign_Status': campaign_status,
                 'Campaign_Objective': campaign_objective,
-                'Campaign_Budget_Type': campaign_budget_type,
-                'Campaign_Budget': campaign_budget_amount,
-                'Campaign_Bid_Strategy': campaign_bid_strategy,
-                
-                # Ad Set Details
-                'AdSet_Name': adset_name,
-                'AdSet_Status': adset_status,
-                'AdSet_Optimization_Goal': adset_optimization_goal,
-                'AdSet_Billing_Event': adset_billing_event,
-                'Age_Targeting': age_targeting,
-                'Gender_Targeting': gender_targeting,
-                'Location_Targeting': location_targeting,
-                
-                # Ad Details
-                'Ad_Name': ad_name,
-                'Ad_Status': ad_status,
-                'Ad_Preview_Link': ad_preview_link,
-                
-                # Change Details
-                'Changed_From': change_from,
-                'Changed_To': change_to,
-                
-                # Meta
+                'Timestamp': timestamp_parsed,
                 'Raw_Event_Type': activity.get('event_type', '')
             })
         
@@ -502,7 +303,7 @@ class EnhancedMetaActivityTracker:
     def fetch_meta_activities(self, hours=24):
         """Fetch all activities from all accounts in parallel"""
         print("\n" + "="*80)
-        print(f"FETCHING HUMAN-INITIATED META ACTIVITIES (Last {hours} hours)")
+        print(f"FETCHING META ACTIVITIES (Last {hours} hours)")
         print("="*80)
         
         accounts = self.get_all_ad_accounts()
@@ -513,7 +314,6 @@ class EnhancedMetaActivityTracker:
         all_activities = []
         
         print(f"\nProcessing {len(accounts)} accounts with {self.max_workers} workers...")
-        print("🔍 Filtering: Human activities only (excluding Meta's automated actions)")
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
@@ -536,15 +336,13 @@ class EnhancedMetaActivityTracker:
         print(f"\n✅ Processing complete!")
         
         if not all_activities:
-            print("ℹ️ No human activities found in the specified time period")
+            print("ℹ️ No activities found in the specified time period")
             return pd.DataFrame()
         
         df = pd.DataFrame(all_activities)
         
         if 'Timestamp' in df.columns:
             df = df.sort_values('Timestamp', ascending=False)
-        
-        print(f"📊 Found {len(df)} human-initiated activities")
         
         return df
 
@@ -601,17 +399,17 @@ class EnhancedMetaActivityTracker:
             match = self._find_best_brand_match(brand_name)
             if match:
                 return pd.Series({
-                    'Matched_Airtable_Brand': match['original_name'],
                     'FB_Manager': match['FB_Manager'],
                     'Brand_Manager': match['Brand_Manager'],
-                    'Current_Team': match['Current_Team']
+                    'Current_Team': match['Current_Team'],
+                    'Matched_Airtable_Brand': match['original_name']
                 })
             else:
                 return pd.Series({
-                    'Matched_Airtable_Brand': '',
                     'FB_Manager': 'Unknown',
                     'Brand_Manager': 'Unknown',
-                    'Current_Team': 'Unknown'
+                    'Current_Team': 'Unknown',
+                    'Matched_Airtable_Brand': ''
                 })
         
         print("\n   Applying fuzzy matching...")
@@ -629,38 +427,16 @@ class EnhancedMetaActivityTracker:
         if unmapped_count > 0:
             unmapped_brands = activities_df[activities_df['FB_Manager'] == 'Unknown']['Brand'].unique()
             print(f"\n   Unmapped brands ({len(unmapped_brands)}):")
-            for brand in unmapped_brands[:10]:
+            for brand in unmapped_brands[:15]:
                 print(f"      - {brand}")
-            if len(unmapped_brands) > 10:
-                print(f"      ... and {len(unmapped_brands) - 10} more")
+            if len(unmapped_brands) > 15:
+                print(f"      ... and {len(unmapped_brands) - 15} more")
         
-        # Reorder columns for better readability
         column_order = [
-            # Identification
             'Brand', 'Matched_Airtable_Brand', 'FB_Manager', 'Brand_Manager', 'Current_Team',
-            
-            # Activity Context
-            'Actor', 'Action', 'Action_Type', 'Timestamp',
-            
-            # Campaign Info
-            'Campaign_Name', 'Campaign_Status', 'Campaign_Objective', 
-            'Campaign_Budget_Type', 'Campaign_Budget', 'Campaign_Bid_Strategy',
-            
-            # Ad Set Info
-            'AdSet_Name', 'AdSet_Status', 'AdSet_Optimization_Goal', 'AdSet_Billing_Event',
-            'Age_Targeting', 'Gender_Targeting', 'Location_Targeting',
-            
-            # Ad Info
-            'Ad_Name', 'Ad_Status', 'Ad_Preview_Link',
-            
-            # Change Details
-            'Changed_From', 'Changed_To',
-            
-            # Account Info
-            'Account_ID', 'Account_Name',
-            
-            # Meta
-            'Fetch_Date', 'Raw_Event_Type'
+            'Account_ID', 'Account_Name', 'Actor', 'Action',
+            'Object_Name', 'Object_Type', 'Campaign_Status', 'Campaign_Objective',
+            'Timestamp', 'Fetch_Date', 'Raw_Event_Type'
         ]
         
         column_order = [col for col in column_order if col in activities_df.columns]
@@ -668,6 +444,7 @@ class EnhancedMetaActivityTracker:
         
         return activities_df
 
+    # ============ NEW METHOD 1: SMART FETCH ============
     def get_last_entry_time_from_sheet(self):
         """Get the most recent timestamp from existing Google Sheet data"""
         if self.gspread_client is None:
@@ -707,6 +484,7 @@ class EnhancedMetaActivityTracker:
             print(f"⚠️ Could not read last entry time: {e}")
             return None
 
+    # ============ NEW METHOD 2: ACTIVITY LOGGER ============
     def log_github_activity(self, action, details):
         """Log activities to GitHub Actions Log sheet"""
         if self.gspread_client is None:
@@ -805,7 +583,7 @@ class EnhancedMetaActivityTracker:
                 
                 if not existing_df.empty:
                     def create_unique_id(row):
-                        return f"{row['Account_ID']}_{row.get('Campaign_Name', row.get('Object_Name', ''))}_{row['Timestamp']}_{row['Action']}"
+                        return f"{row['Account_ID']}_{row['Object_Name']}_{row['Timestamp']}_{row['Action']}"
                     
                     existing_df['_unique_id'] = existing_df.apply(create_unique_id, axis=1)
                     df['_unique_id'] = df.apply(create_unique_id, axis=1)
@@ -848,13 +626,12 @@ class EnhancedMetaActivityTracker:
                 ws = sh.add_worksheet(
                     title=sheet_name, 
                     rows=max(1000, len(df) + 50),
-                    cols=max(30, len(df.columns) + 5)
+                    cols=max(20, len(df.columns) + 5)
                 )
                 print(f"✅ Created new sheet '{sheet_name}'")
             
             set_with_dataframe(ws, df, include_index=False, include_column_header=True)
             
-            # Format header row
             ws.format('1:1', {
                 'textFormat': {'bold': True, 'fontSize': 11},
                 'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.2},
@@ -871,13 +648,13 @@ class EnhancedMetaActivityTracker:
         except Exception as e:
             print(f"❌ Upload failed: {e}")
 
+    # ============ UPDATED run() METHOD ============
     def run(self, hours=24, append_mode=False, save_csv=False):
-        """Main execution pipeline with smart fetching and enhanced details"""
+        """Main execution pipeline with smart fetching"""
         start_time = time.time()
         
         print("="*80)
-        print("ENHANCED META ACTIVITY TRACKER")
-        print("Human-Initiated Activities Only | Detailed Breakdown")
+        print("META ACTIVITY TRACKER WITH AIRTABLE MAPPING")
         print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Initial hours parameter: {hours}")
         print(f"Mode: {'APPEND' if append_mode else 'REPLACE'}")
@@ -910,14 +687,14 @@ class EnhancedMetaActivityTracker:
                 print(f"\nℹ️ No previous data found, using default: {hours} hours\n")
                 self.log_github_activity('📋 First Run', f'Fetching last {hours} hours')
         
-        self.log_github_activity('🚀 Enhanced Tracker Started', f'Fetching last {hours} hours (Human activities only)')
+        self.log_github_activity('🚀 Tracker Started', f'Fetching last {hours} hours')
         
         self.brand_mapping_df = self.fetch_airtable_data()
         activities_df = self.fetch_meta_activities(hours=hours)
         
         if activities_df.empty:
-            print("\n✅ Process complete - no human-initiated activities found")
-            self.log_github_activity('ℹ️ No New Activities', f'No human activities in last {hours}h')
+            print("\n✅ Process complete - no activities found")
+            self.log_github_activity('ℹ️ No New Activities', f'No activities in last {hours}h')
             return activities_df
         
         final_df = self.map_airtable_to_activities(activities_df)
@@ -928,15 +705,12 @@ class EnhancedMetaActivityTracker:
             time_range = 'N/A'
         
         print("\n" + "="*80)
-        print("ENHANCED ACTIVITY SUMMARY")
+        print("ACTIVITY SUMMARY")
         print("="*80)
-        print(f"Total human activities: {len(final_df)}")
+        print(f"Total activities: {len(final_df)}")
         print(f"Unique brands: {final_df['Brand'].nunique()}")
         print(f"Unique actors: {final_df['Actor'].nunique()}")
         print(f"Time range: {time_range}")
-        
-        print("\n📊 Activity Breakdown by Type:")
-        print(final_df['Action_Type'].value_counts())
         
         print("\n📊 Top 10 Most Active Brands:")
         print(final_df['Brand'].value_counts().head(10))
@@ -944,26 +718,12 @@ class EnhancedMetaActivityTracker:
         print("\n📊 Top 10 Most Active People:")
         print(final_df['Actor'].value_counts().head(10))
         
-        print("\n📊 Top 10 Action Types:")
+        print("\n📊 Activity Types:")
         print(final_df['Action'].value_counts().head(10))
-        
-        print("\n📊 Campaign Objectives Distribution:")
-        campaign_obj = final_df[final_df['Campaign_Objective'] != 'N/A']['Campaign_Objective'].value_counts()
-        if not campaign_obj.empty:
-            print(campaign_obj.head(10))
-        else:
-            print("   No campaign objective data available")
-        
-        print("\n📊 Ad Set Optimization Goals:")
-        adset_goals = final_df[final_df['AdSet_Optimization_Goal'] != 'N/A']['AdSet_Optimization_Goal'].value_counts()
-        if not adset_goals.empty:
-            print(adset_goals.head(10))
-        else:
-            print("   No ad set optimization data available")
         
         if save_csv:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            csv_file = f"meta_activities_enhanced_{timestamp}.csv"
+            csv_file = f"meta_activities_{timestamp}.csv"
             final_df.to_csv(csv_file, index=False)
             print(f"\n💾 Saved to: {csv_file}")
         
@@ -971,8 +731,8 @@ class EnhancedMetaActivityTracker:
             self.upload_to_sheets(final_df, append_mode=append_mode)
             duration = (time.time() - start_time) / 60
             self.log_github_activity(
-                '✅ Enhanced Tracker Completed',
-                f'{len(final_df)} human activities in {duration:.1f}min. Range: {time_range}'
+                '✅ Tracker Completed',
+                f'{len(final_df)} activities in {duration:.1f}min. Range: {time_range}'
             )
         
         return final_df
@@ -983,8 +743,7 @@ if __name__ == "__main__":
     import sys
     
     print("\n" + "="*80)
-    print("🚀 ENHANCED META ACTIVITY TRACKER - GITHUB ACTIONS")
-    print("Human Activities Only | Detailed Campaign/AdSet/Ad Breakdown")
+    print("🚀 META ACTIVITY TRACKER - GITHUB ACTIONS")
     print("="*80)
     
     # Get environment variables
@@ -1029,12 +788,11 @@ if __name__ == "__main__":
     print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"   Credentials: {GOOGLE_CREDENTIALS_PATH}")
     print(f"   Sheet ID: {GOOGLE_SPREADSHEET_ID[:20]}...")
-    print(f"   Filter: Human-initiated activities only")
     print("="*80 + "\n")
     
     try:
         # Create tracker instance
-        tracker = EnhancedMetaActivityTracker(
+        tracker = MetaActivityTrackerWithAirtable(
             meta_access_token=META_ACCESS_TOKEN,
             airtable_token=AIRTABLE_TOKEN,
             airtable_base_id=AIRTABLE_BASE_ID,
@@ -1049,19 +807,18 @@ if __name__ == "__main__":
         
         # Success summary
         print("\n" + "="*80)
-        print("✅ ENHANCED TRACKER COMPLETED SUCCESSFULLY! 🎉")
+        print("✅ TRACKER COMPLETED SUCCESSFULLY! 🎉")
         print("="*80)
-        print(f"   Human activities processed: {len(results)}")
+        print(f"   Activities processed: {len(results)}")
         print(f"   Unique brands: {results['Brand'].nunique() if not results.empty else 0}")
-        print(f"   Activity types tracked: CAMPAIGN, ADSET, AD")
-        print(f"   Data saved to Google Sheets with full details")
+        print(f"   Data saved to Google Sheets")
         print("="*80 + "\n")
         
         sys.exit(0)
         
     except Exception as e:
         print("\n" + "="*80)
-        print("❌ ENHANCED TRACKER FAILED")
+        print("❌ TRACKER FAILED")
         print("="*80)
         print(f"Error: {str(e)}")
         print("\nFull traceback:")
