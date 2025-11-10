@@ -18,8 +18,29 @@ from gspread_dataframe import set_with_dataframe
 load_dotenv()
 
 
-class MetaActivityTrackerWithAirtable:
-    """Meta activity tracker with Airtable brand/manager mapping"""
+class EnhancedMetaActivityTrackerWithAirtable:
+    """Enhanced Meta activity tracker with COMPLETE HIERARCHY + Airtable mapping"""
+    
+    # Activities to EXCLUDE (Meta's automated actions)
+    EXCLUDED_EVENT_TYPES = {
+        'ad_account_update_spend_limit',
+        'ad_account_reset_spend_limit',
+        'ad_account_billing_charge',
+        'ad_account_billing_charge_failed',
+        'ad_account_billing_decline',
+        'ad_review_approved',
+        'ad_review_declined',
+        'automatic_placement_optimization',
+        'campaign_budget_optimization',
+        'auto_bid_adjustment',
+        'delivery_insights_notification'
+    }
+    
+    # Human-initiated activities we WANT
+    INCLUDED_ACTIONS = {
+        'create', 'update', 'delete', 'pause', 'resume', 'archive',
+        'edit', 'change', 'modify', 'activate', 'deactivate'
+    }
     
     def __init__(self,
                  meta_access_token,
@@ -28,7 +49,8 @@ class MetaActivityTrackerWithAirtable:
                  airtable_table_name,
                  google_credentials_path=None,
                  google_spreadsheet_id=None,
-                 max_workers=5):
+                 max_workers=5,
+                 debug_mode=False):
         
         # Meta API
         self.meta_access_token = meta_access_token
@@ -49,12 +71,23 @@ class MetaActivityTrackerWithAirtable:
         self.max_workers = max_workers
         self.brand_mapping_df = None
         self.brand_mapping_dict = {}
+        
+        # DEBUG MODE
+        self.debug_mode = debug_mode
+        self.debug_stats = {
+            'object_types_found': {},
+            'hierarchy_built': {'campaign_group': 0, 'campaign': 0, 'adgroup': 0},
+            'api_calls': {'campaign': 0, 'adset': 0, 'ad': 0},
+            'api_errors': {'400': 0, '403': 0, '404': 0, '500': 0, 'other': 0},
+            'skipped_objects': [],
+            'hierarchy_errors': []
+        }
 
     def _create_session_with_retries(self):
         session = requests.Session()
         retry = Retry(
             total=3,
-            backoff_factor=0.3,
+            backoff_factor=0.5,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
@@ -63,14 +96,100 @@ class MetaActivityTrackerWithAirtable:
         session.mount("http://", adapter)
         return session
 
-    def _make_api_request(self, url, params=None, headers=None, timeout=10):
-        try:
-            r = self.session.get(url, params=params, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            print(f"⚠️ API request failed: {e}")
-            return None
+    def _is_valid_meta_id(self, object_id):
+        """Validate if an ID looks like a valid Meta object ID"""
+        if not object_id:
+            return False
+        
+        object_id = str(object_id).strip()
+        
+        if len(object_id) < 10 or len(object_id) > 25:
+            return False
+        
+        if not object_id.isdigit():
+            return False
+        
+        return True
+
+    def _make_api_request(self, url, params=None, headers=None, timeout=10, retries=2):
+        """Enhanced API request with better error handling"""
+        for attempt in range(retries + 1):
+            try:
+                r = self.session.get(url, params=params, headers=headers, timeout=timeout)
+                
+                if r.status_code == 400:
+                    self.debug_stats['api_errors']['400'] += 1
+                    if self.debug_mode:
+                        print(f"      ⚠️ 400 Bad Request - Invalid ID or permissions issue")
+                    return None
+                
+                elif r.status_code == 403:
+                    self.debug_stats['api_errors']['403'] += 1
+                    if self.debug_mode:
+                        print(f"      ⚠️ 403 Forbidden - Access denied")
+                    return None
+                
+                elif r.status_code == 404:
+                    self.debug_stats['api_errors']['404'] += 1
+                    if self.debug_mode:
+                        print(f"      ⚠️ 404 Not Found - Object may be deleted")
+                    return None
+                
+                elif r.status_code >= 500:
+                    if attempt < retries:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    else:
+                        self.debug_stats['api_errors']['500'] += 1
+                        if self.debug_mode:
+                            print(f"      ⚠️ {r.status_code} Server Error - Retries exhausted")
+                        return None
+                
+                r.raise_for_status()
+                return r.json()
+                
+            except requests.exceptions.Timeout:
+                if attempt < retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                if self.debug_mode:
+                    print(f"      ⚠️ Request timeout")
+                return None
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < retries and '500' in str(e):
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                    
+                self.debug_stats['api_errors']['other'] += 1
+                if self.debug_mode:
+                    print(f"      ⚠️ Request failed: {str(e)[:100]}")
+                return None
+                
+            except Exception as e:
+                if self.debug_mode:
+                    print(f"      ⚠️ Unexpected error: {str(e)[:100]}")
+                return None
+        
+        return None
+
+    def _is_human_activity(self, activity):
+        """Filter to include only human-initiated activities"""
+        event_type = activity.get('event_type', '').lower()
+        translated_event = activity.get('translated_event_type', '').lower()
+        
+        if event_type in self.EXCLUDED_EVENT_TYPES:
+            return False
+        
+        for action in self.INCLUDED_ACTIONS:
+            if action in event_type or action in translated_event:
+                return True
+        
+        actor = activity.get('actor_name', '')
+        if actor and actor.lower() not in ['meta', 'facebook', 'system', 'automated']:
+            return True
+        
+        return False
 
     def _normalize_brand_name(self, name):
         """Normalize brand name for matching"""
@@ -193,7 +312,7 @@ class MetaActivityTrackerWithAirtable:
             'access_token': self.meta_access_token,
             'since': since_iso,
             'limit': 500,
-            'fields': 'event_type,event_time,actor_name,object_name,object_type,object_id,translated_event_type'
+            'fields': 'event_type,event_time,actor_name,object_name,object_type,object_id,translated_event_type,extra_data'
         }
         
         activities = []
@@ -202,7 +321,9 @@ class MetaActivityTrackerWithAirtable:
             if not data or 'data' not in data:
                 break
             
-            activities.extend(data.get('data', []))
+            raw_activities = data.get('data', [])
+            human_activities = [act for act in raw_activities if self._is_human_activity(act)]
+            activities.extend(human_activities)
             
             paging = data.get('paging', {})
             next_url = paging.get('next')
@@ -214,35 +335,329 @@ class MetaActivityTrackerWithAirtable:
         
         return activities
 
-    def get_campaigns_for_account(self, ad_account_id):
-        """Get campaigns to extract brand info"""
-        url = f"{self.meta_base_url}/{ad_account_id}/campaigns"
+    def get_campaign_details(self, campaign_id):
+        """Get detailed CAMPAIGN information with validation"""
+        if not self._is_valid_meta_id(campaign_id):
+            if self.debug_mode:
+                print(f"      ⚠️ Invalid campaign ID: {campaign_id}")
+            self.debug_stats['skipped_objects'].append(f"campaign:{campaign_id}")
+            return None
+        
+        url = f"{self.meta_base_url}/{campaign_id}"
         params = {
             'access_token': self.meta_access_token,
-            'fields': 'id,name,status,effective_status,objective,created_time,updated_time',
-            'limit': 500
+            'fields': 'id,name,status,effective_status,objective,created_time,updated_time,start_time,stop_time,daily_budget,lifetime_budget,budget_remaining,bid_strategy,special_ad_categories'
         }
         
-        campaigns = []
-        while True:
-            data = self._make_api_request(url, params)
-            if not data or 'data' not in data:
-                break
-            
-            campaigns.extend(data.get('data', []))
-            
-            paging = data.get('paging', {})
-            next_url = paging.get('next')
-            if not next_url:
-                break
-            url = next_url
-            params = {}
-            time.sleep(0.03)
+        self.debug_stats['api_calls']['campaign'] += 1
+        data = self._make_api_request(url, params)
         
-        return campaigns
+        if self.debug_mode and data:
+            print(f"      ✅ Campaign fetched: {data.get('name', 'Unknown')}")
+        
+        return data
+
+    def get_adset_details(self, adset_id):
+        """Get detailed AD SET information with validation"""
+        if not self._is_valid_meta_id(adset_id):
+            if self.debug_mode:
+                print(f"      ⚠️ Invalid adset ID: {adset_id}")
+            self.debug_stats['skipped_objects'].append(f"adset:{adset_id}")
+            return None
+        
+        url = f"{self.meta_base_url}/{adset_id}"
+        params = {
+            'access_token': self.meta_access_token,
+            'fields': 'id,name,status,effective_status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_amount,targeting,start_time,end_time,created_time,updated_time'
+        }
+        
+        self.debug_stats['api_calls']['adset'] += 1
+        data = self._make_api_request(url, params)
+        
+        if self.debug_mode and data:
+            print(f"      ✅ AdSet fetched: {data.get('name', 'Unknown')}")
+        
+        return data
+
+    def get_ad_details(self, ad_id):
+        """Get detailed AD information with validation"""
+        if not self._is_valid_meta_id(ad_id):
+            if self.debug_mode:
+                print(f"      ⚠️ Invalid ad ID: {ad_id}")
+            self.debug_stats['skipped_objects'].append(f"ad:{ad_id}")
+            return None
+        
+        url = f"{self.meta_base_url}/{ad_id}"
+        params = {
+            'access_token': self.meta_access_token,
+            'fields': 'id,name,status,effective_status,adset_id,creative,created_time,updated_time,preview_shareable_link'
+        }
+        
+        self.debug_stats['api_calls']['ad'] += 1
+        data = self._make_api_request(url, params)
+        
+        if self.debug_mode and data:
+            print(f"      ✅ Ad fetched: {data.get('name', 'Unknown')}")
+        
+        return data
+
+    def _extract_targeting_info(self, targeting):
+        """Extract readable targeting information"""
+        if not targeting or not isinstance(targeting, dict):
+            return 'Not Available', 'Not Available', 'Not Available'
+        
+        # Age
+        age_min = targeting.get('age_min', 'N/A')
+        age_max = targeting.get('age_max', 'N/A')
+        age_range = f"{age_min}-{age_max}" if age_min != 'N/A' else 'Not Set'
+        
+        # Gender
+        genders = targeting.get('genders', [])
+        if not genders:
+            gender = 'All'
+        elif 1 in genders and 2 in genders:
+            gender = 'All'
+        elif 1 in genders:
+            gender = 'Male'
+        elif 2 in genders:
+            gender = 'Female'
+        else:
+            gender = 'Not Set'
+        
+        # Locations
+        geo_locations = targeting.get('geo_locations', {})
+        countries = geo_locations.get('countries', [])
+        cities = geo_locations.get('cities', [])
+        regions = geo_locations.get('regions', [])
+        
+        if countries:
+            location = ', '.join(countries[:3])
+            if len(countries) > 3:
+                location += f' +{len(countries)-3} more'
+        elif cities:
+            location = f"{len(cities)} cities"
+        elif regions:
+            location = f"{len(regions)} regions"
+        else:
+            location = 'Not Set'
+        
+        return age_range, gender, location
+
+    def _parse_extra_data(self, extra_data):
+        """Parse extra_data JSON to extract change details"""
+        if not extra_data:
+            return 'N/A', 'N/A'
+        
+        try:
+            if isinstance(extra_data, str):
+                extra_data = json.loads(extra_data)
+            
+            old_value = extra_data.get('old_value', 'N/A')
+            new_value = extra_data.get('new_value', 'N/A')
+            
+            if isinstance(old_value, dict):
+                old_value = json.dumps(old_value, indent=2)
+            if isinstance(new_value, dict):
+                new_value = json.dumps(new_value, indent=2)
+            
+            return str(old_value), str(new_value)
+        except:
+            return 'N/A', 'N/A'
+
+    def _build_complete_hierarchy(self, activity):
+        """
+        Build complete hierarchy with ROBUST error handling
+        
+        Meta's object types:
+        - campaign_group = Campaign
+        - campaign = Ad Set
+        - adgroup = Ad
+        """
+        object_id = activity.get('object_id', '')
+        object_type = activity.get('object_type', '').lower()
+        object_name = activity.get('object_name', '')
+        
+        if object_type:
+            self.debug_stats['object_types_found'][object_type] = \
+                self.debug_stats['object_types_found'].get(object_type, 0) + 1
+        
+        hierarchy = {
+            'Campaign_Name': 'N/A',
+            'Campaign_Status': 'N/A',
+            'Campaign_Objective': 'N/A',
+            'Campaign_Budget_Type': 'N/A',
+            'Campaign_Budget': 'N/A',
+            'Campaign_Bid_Strategy': 'N/A',
+            
+            'AdSet_Name': 'N/A',
+            'AdSet_Status': 'N/A',
+            'AdSet_Optimization_Goal': 'N/A',
+            'AdSet_Billing_Event': 'N/A',
+            'Age_Targeting': 'N/A',
+            'Gender_Targeting': 'N/A',
+            'Location_Targeting': 'N/A',
+            
+            'Ad_Name': 'N/A',
+            'Ad_Status': 'N/A',
+            'Ad_Preview_Link': 'N/A',
+            
+            'Hierarchy_Level': 'UNKNOWN'
+        }
+        
+        try:
+            if self.debug_mode:
+                print(f"\n   🔍 Building hierarchy for: {object_type} - {object_name}")
+            
+            # CASE 1: Campaign Group (This is a CAMPAIGN)
+            if object_type == 'campaign_group':
+                hierarchy['Hierarchy_Level'] = 'CAMPAIGN'
+                campaign_data = self.get_campaign_details(object_id)
+                
+                if campaign_data:
+                    hierarchy['Campaign_Name'] = campaign_data.get('name', object_name)
+                    hierarchy['Campaign_Status'] = campaign_data.get('effective_status', 
+                                                                     campaign_data.get('status', 'N/A'))
+                    hierarchy['Campaign_Objective'] = campaign_data.get('objective', 'N/A')
+                    hierarchy['Campaign_Bid_Strategy'] = campaign_data.get('bid_strategy', 'N/A')
+                    
+                    daily_budget = campaign_data.get('daily_budget')
+                    lifetime_budget = campaign_data.get('lifetime_budget')
+                    
+                    if daily_budget:
+                        hierarchy['Campaign_Budget_Type'] = 'Daily'
+                        hierarchy['Campaign_Budget'] = f"${float(daily_budget)/100:.2f}"
+                    elif lifetime_budget:
+                        hierarchy['Campaign_Budget_Type'] = 'Lifetime'
+                        hierarchy['Campaign_Budget'] = f"${float(lifetime_budget)/100:.2f}"
+                    
+                    self.debug_stats['hierarchy_built']['campaign_group'] += 1
+                else:
+                    hierarchy['Campaign_Name'] = object_name
+                
+                time.sleep(0.05)
+            
+            # CASE 2: Campaign (This is an AD SET)
+            elif object_type == 'campaign':
+                hierarchy['Hierarchy_Level'] = 'ADSET'
+                adset_data = self.get_adset_details(object_id)
+                
+                if adset_data:
+                    hierarchy['AdSet_Name'] = adset_data.get('name', object_name)
+                    hierarchy['AdSet_Status'] = adset_data.get('effective_status', 
+                                                               adset_data.get('status', 'N/A'))
+                    hierarchy['AdSet_Optimization_Goal'] = adset_data.get('optimization_goal', 'N/A')
+                    hierarchy['AdSet_Billing_Event'] = adset_data.get('billing_event', 'N/A')
+                    
+                    targeting = adset_data.get('targeting', {})
+                    age, gender, location = self._extract_targeting_info(targeting)
+                    hierarchy['Age_Targeting'] = age
+                    hierarchy['Gender_Targeting'] = gender
+                    hierarchy['Location_Targeting'] = location
+                    
+                    campaign_id = adset_data.get('campaign_id')
+                    if campaign_id:
+                        if self.debug_mode:
+                            print(f"      🔗 Fetching parent campaign: {campaign_id}")
+                        
+                        time.sleep(0.05)
+                        campaign_data = self.get_campaign_details(campaign_id)
+                        
+                        if campaign_data:
+                            hierarchy['Campaign_Name'] = campaign_data.get('name', 'N/A')
+                            hierarchy['Campaign_Status'] = campaign_data.get('effective_status', 'N/A')
+                            hierarchy['Campaign_Objective'] = campaign_data.get('objective', 'N/A')
+                            hierarchy['Campaign_Bid_Strategy'] = campaign_data.get('bid_strategy', 'N/A')
+                            
+                            daily_budget = campaign_data.get('daily_budget')
+                            lifetime_budget = campaign_data.get('lifetime_budget')
+                            
+                            if daily_budget:
+                                hierarchy['Campaign_Budget_Type'] = 'Daily'
+                                hierarchy['Campaign_Budget'] = f"${float(daily_budget)/100:.2f}"
+                            elif lifetime_budget:
+                                hierarchy['Campaign_Budget_Type'] = 'Lifetime'
+                                hierarchy['Campaign_Budget'] = f"${float(lifetime_budget)/100:.2f}"
+                    
+                    self.debug_stats['hierarchy_built']['campaign'] += 1
+                else:
+                    hierarchy['AdSet_Name'] = object_name
+                
+                time.sleep(0.05)
+            
+            # CASE 3: AdGroup (This is an AD)
+            elif object_type == 'adgroup':
+                hierarchy['Hierarchy_Level'] = 'AD'
+                ad_data = self.get_ad_details(object_id)
+                
+                if ad_data:
+                    hierarchy['Ad_Name'] = ad_data.get('name', object_name)
+                    hierarchy['Ad_Status'] = ad_data.get('effective_status', 
+                                                         ad_data.get('status', 'N/A'))
+                    hierarchy['Ad_Preview_Link'] = ad_data.get('preview_shareable_link', 'N/A')
+                    
+                    adset_id = ad_data.get('adset_id')
+                    if adset_id:
+                        if self.debug_mode:
+                            print(f"      🔗 Fetching parent adset: {adset_id}")
+                        
+                        time.sleep(0.05)
+                        adset_data = self.get_adset_details(adset_id)
+                        
+                        if adset_data:
+                            hierarchy['AdSet_Name'] = adset_data.get('name', 'N/A')
+                            hierarchy['AdSet_Status'] = adset_data.get('effective_status', 'N/A')
+                            hierarchy['AdSet_Optimization_Goal'] = adset_data.get('optimization_goal', 'N/A')
+                            hierarchy['AdSet_Billing_Event'] = adset_data.get('billing_event', 'N/A')
+                            
+                            targeting = adset_data.get('targeting', {})
+                            age, gender, location = self._extract_targeting_info(targeting)
+                            hierarchy['Age_Targeting'] = age
+                            hierarchy['Gender_Targeting'] = gender
+                            hierarchy['Location_Targeting'] = location
+                            
+                            campaign_id = adset_data.get('campaign_id')
+                            if campaign_id:
+                                if self.debug_mode:
+                                    print(f"      🔗 Fetching grandparent campaign: {campaign_id}")
+                                
+                                time.sleep(0.05)
+                                campaign_data = self.get_campaign_details(campaign_id)
+                                
+                                if campaign_data:
+                                    hierarchy['Campaign_Name'] = campaign_data.get('name', 'N/A')
+                                    hierarchy['Campaign_Status'] = campaign_data.get('effective_status', 'N/A')
+                                    hierarchy['Campaign_Objective'] = campaign_data.get('objective', 'N/A')
+                                    hierarchy['Campaign_Bid_Strategy'] = campaign_data.get('bid_strategy', 'N/A')
+                                    
+                                    daily_budget = campaign_data.get('daily_budget')
+                                    lifetime_budget = campaign_data.get('lifetime_budget')
+                                    
+                                    if daily_budget:
+                                        hierarchy['Campaign_Budget_Type'] = 'Daily'
+                                        hierarchy['Campaign_Budget'] = f"${float(daily_budget)/100:.2f}"
+                                    elif lifetime_budget:
+                                        hierarchy['Campaign_Budget_Type'] = 'Lifetime'
+                                        hierarchy['Campaign_Budget'] = f"${float(lifetime_budget)/100:.2f}"
+                    
+                    self.debug_stats['hierarchy_built']['adgroup'] += 1
+                else:
+                    hierarchy['Ad_Name'] = object_name
+                
+                time.sleep(0.05)
+            
+            else:
+                hierarchy['Hierarchy_Level'] = f'OTHER:{object_type}'
+        
+        except Exception as e:
+            error_msg = f"{object_type} - {object_id}: {str(e)}"
+            self.debug_stats['hierarchy_errors'].append(error_msg)
+            if self.debug_mode:
+                print(f"      ❌ Hierarchy build error: {e}")
+        
+        return hierarchy
 
     def _process_account(self, account, hours=24):
-        """Process one account - get activities and basic info"""
+        """Process one account - get activities with COMPLETE hierarchy"""
         account_id = account.get('id')
         account_name = account.get('name', 'Unknown')
         business_name = account.get('business_name', '')
@@ -254,26 +669,16 @@ class MetaActivityTrackerWithAirtable:
         if not activities:
             return []
         
-        campaigns = self.get_campaigns_for_account(account_id) or []
-        campaign_lookup = {c['id']: c for c in campaigns}
+        if self.debug_mode:
+            print(f"\n📦 Processing account: {account_name} ({account_id})")
+            print(f"   Found {len(activities)} human activities")
         
         results = []
         for activity in activities:
-            object_id = activity.get('object_id', '')
-            object_name = activity.get('object_name', '')
-            object_type = activity.get('object_type', '')
+            hierarchy = self._build_complete_hierarchy(activity)
             
-            campaign_name = ''
-            campaign_status = ''
-            campaign_objective = ''
-            
-            if object_type == 'campaign' and object_id in campaign_lookup:
-                camp = campaign_lookup[object_id]
-                campaign_name = camp.get('name', object_name)
-                campaign_status = camp.get('effective_status', camp.get('status', ''))
-                campaign_objective = camp.get('objective', '')
-            else:
-                campaign_name = object_name
+            extra_data = activity.get('extra_data', {})
+            change_from, change_to = self._parse_extra_data(extra_data)
             
             timestamp = activity.get('event_time', '')
             timestamp_parsed = ''
@@ -288,13 +693,37 @@ class MetaActivityTrackerWithAirtable:
                 'Brand': brand,
                 'Account_ID': account_id,
                 'Account_Name': account_name,
+                
                 'Actor': activity.get('actor_name', 'Unknown'),
                 'Action': activity.get('translated_event_type', activity.get('event_type', 'Unknown')),
-                'Object_Name': campaign_name,
-                'Object_Type': object_type,
-                'Campaign_Status': campaign_status,
-                'Campaign_Objective': campaign_objective,
+                'Hierarchy_Level': hierarchy['Hierarchy_Level'],
                 'Timestamp': timestamp_parsed,
+                
+                'Campaign_Name': hierarchy['Campaign_Name'],
+                'Campaign_Status': hierarchy['Campaign_Status'],
+                'Campaign_Objective': hierarchy['Campaign_Objective'],
+                'Campaign_Budget_Type': hierarchy['Campaign_Budget_Type'],
+                'Campaign_Budget': hierarchy['Campaign_Budget'],
+                'Campaign_Bid_Strategy': hierarchy['Campaign_Bid_Strategy'],
+                
+                'AdSet_Name': hierarchy['AdSet_Name'],
+                'AdSet_Status': hierarchy['AdSet_Status'],
+                'AdSet_Optimization_Goal': hierarchy['AdSet_Optimization_Goal'],
+                'AdSet_Billing_Event': hierarchy['AdSet_Billing_Event'],
+                'Age_Targeting': hierarchy['Age_Targeting'],
+                'Gender_Targeting': hierarchy['Gender_Targeting'],
+                'Location_Targeting': hierarchy['Location_Targeting'],
+                
+                'Ad_Name': hierarchy['Ad_Name'],
+                'Ad_Status': hierarchy['Ad_Status'],
+                'Ad_Preview_Link': hierarchy['Ad_Preview_Link'],
+                
+                'Changed_From': change_from,
+                'Changed_To': change_to,
+                
+                'Object_Name': activity.get('object_name', ''),
+                'Object_ID': activity.get('object_id', ''),
+                'Object_Type_Raw': activity.get('object_type', ''),
                 'Raw_Event_Type': activity.get('event_type', '')
             })
         
@@ -303,7 +732,7 @@ class MetaActivityTrackerWithAirtable:
     def fetch_meta_activities(self, hours=24):
         """Fetch all activities from all accounts in parallel"""
         print("\n" + "="*80)
-        print(f"FETCHING META ACTIVITIES (Last {hours} hours)")
+        print(f"FETCHING META ACTIVITIES WITH COMPLETE HIERARCHY (Last {hours} hours)")
         print("="*80)
         
         accounts = self.get_all_ad_accounts()
@@ -314,6 +743,9 @@ class MetaActivityTrackerWithAirtable:
         all_activities = []
         
         print(f"\nProcessing {len(accounts)} accounts with {self.max_workers} workers...")
+        print("🔍 Building complete Campaign → AdSet → Ad hierarchy")
+        if self.debug_mode:
+            print("🛠 DEBUG MODE ENABLED\n")
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
@@ -336,13 +768,49 @@ class MetaActivityTrackerWithAirtable:
         print(f"\n✅ Processing complete!")
         
         if not all_activities:
-            print("ℹ️ No activities found in the specified time period")
+            print("ℹ️ No activities found")
             return pd.DataFrame()
         
         df = pd.DataFrame(all_activities)
         
         if 'Timestamp' in df.columns:
             df = df.sort_values('Timestamp', ascending=False)
+        
+        print(f"📊 Found {len(df)} activities")
+        
+        print("\n" + "="*80)
+        print("🗂️ HIERARCHY BUILD STATISTICS")
+        print("="*80)
+        print(f"✅ Campaign hierarchies built: {self.debug_stats['hierarchy_built']['campaign_group']}")
+        print(f"✅ AdSet hierarchies built: {self.debug_stats['hierarchy_built']['campaign']}")
+        print(f"✅ Ad hierarchies built: {self.debug_stats['hierarchy_built']['adgroup']}")
+        
+        print(f"\n📊 Object Types Found:")
+        for obj_type, count in sorted(self.debug_stats['object_types_found'].items(), key=lambda x: x[1], reverse=True):
+            print(f"   {obj_type}: {count}")
+        
+        print(f"\n🔧 API Calls Made:")
+        print(f"   Campaign API calls: {self.debug_stats['api_calls']['campaign']}")
+        print(f"   AdSet API calls: {self.debug_stats['api_calls']['adset']}")
+        print(f"   Ad API calls: {self.debug_stats['api_calls']['ad']}")
+        
+        print(f"\n⚠️ API Errors Encountered:")
+        print(f"   400 (Bad Request): {self.debug_stats['api_errors']['400']}")
+        print(f"   403 (Forbidden): {self.debug_stats['api_errors']['403']}")
+        print(f"   404 (Not Found): {self.debug_stats['api_errors']['404']}")
+        print(f"   500 (Server Error): {self.debug_stats['api_errors']['500']}")
+        print(f"   Other errors: {self.debug_stats['api_errors']['other']}")
+        
+        if self.debug_stats['skipped_objects']:
+            print(f"\n⏭️ Skipped Objects (invalid IDs): {len(self.debug_stats['skipped_objects'])}")
+            if self.debug_mode:
+                for obj in self.debug_stats['skipped_objects'][:10]:
+                    print(f"   {obj}")
+        
+        if self.debug_stats['hierarchy_errors']:
+            print(f"\n⚠️ Hierarchy Errors (first 10):")
+            for error in self.debug_stats['hierarchy_errors'][:10]:
+                print(f"   {error}")
         
         return df
 
@@ -399,17 +867,17 @@ class MetaActivityTrackerWithAirtable:
             match = self._find_best_brand_match(brand_name)
             if match:
                 return pd.Series({
+                    'Matched_Airtable_Brand': match['original_name'],
                     'FB_Manager': match['FB_Manager'],
                     'Brand_Manager': match['Brand_Manager'],
-                    'Current_Team': match['Current_Team'],
-                    'Matched_Airtable_Brand': match['original_name']
+                    'Current_Team': match['Current_Team']
                 })
             else:
                 return pd.Series({
+                    'Matched_Airtable_Brand': '',
                     'FB_Manager': 'Unknown',
                     'Brand_Manager': 'Unknown',
-                    'Current_Team': 'Unknown',
-                    'Matched_Airtable_Brand': ''
+                    'Current_Team': 'Unknown'
                 })
         
         print("\n   Applying fuzzy matching...")
@@ -427,16 +895,22 @@ class MetaActivityTrackerWithAirtable:
         if unmapped_count > 0:
             unmapped_brands = activities_df[activities_df['FB_Manager'] == 'Unknown']['Brand'].unique()
             print(f"\n   Unmapped brands ({len(unmapped_brands)}):")
-            for brand in unmapped_brands[:15]:
+            for brand in unmapped_brands[:10]:
                 print(f"      - {brand}")
-            if len(unmapped_brands) > 15:
-                print(f"      ... and {len(unmapped_brands) - 15} more")
+            if len(unmapped_brands) > 10:
+                print(f"      ... and {len(unmapped_brands) - 10} more")
         
         column_order = [
             'Brand', 'Matched_Airtable_Brand', 'FB_Manager', 'Brand_Manager', 'Current_Team',
-            'Account_ID', 'Account_Name', 'Actor', 'Action',
-            'Object_Name', 'Object_Type', 'Campaign_Status', 'Campaign_Objective',
-            'Timestamp', 'Fetch_Date', 'Raw_Event_Type'
+            'Actor', 'Action', 'Hierarchy_Level', 'Timestamp',
+            'Campaign_Name', 'Campaign_Status', 'Campaign_Objective', 
+            'Campaign_Budget_Type', 'Campaign_Budget', 'Campaign_Bid_Strategy',
+            'AdSet_Name', 'AdSet_Status', 'AdSet_Optimization_Goal', 'AdSet_Billing_Event',
+            'Age_Targeting', 'Gender_Targeting', 'Location_Targeting',
+            'Ad_Name', 'Ad_Status', 'Ad_Preview_Link',
+            'Changed_From', 'Changed_To',
+            'Account_ID', 'Account_Name',
+            'Object_Name', 'Object_ID', 'Object_Type_Raw', 'Raw_Event_Type', 'Fetch_Date'
         ]
         
         column_order = [col for col in column_order if col in activities_df.columns]
@@ -444,7 +918,6 @@ class MetaActivityTrackerWithAirtable:
         
         return activities_df
 
-    # ============ NEW METHOD 1: SMART FETCH ============
     def get_last_entry_time_from_sheet(self):
         """Get the most recent timestamp from existing Google Sheet data"""
         if self.gspread_client is None:
@@ -484,7 +957,6 @@ class MetaActivityTrackerWithAirtable:
             print(f"⚠️ Could not read last entry time: {e}")
             return None
 
-    # ============ NEW METHOD 2: ACTIVITY LOGGER ============
     def log_github_activity(self, action, details):
         """Log activities to GitHub Actions Log sheet"""
         if self.gspread_client is None:
@@ -583,7 +1055,7 @@ class MetaActivityTrackerWithAirtable:
                 
                 if not existing_df.empty:
                     def create_unique_id(row):
-                        return f"{row['Account_ID']}_{row['Object_Name']}_{row['Timestamp']}_{row['Action']}"
+                        return f"{row['Account_ID']}_{row.get('Object_Name', '')}_{row['Timestamp']}_{row['Action']}"
                     
                     existing_df['_unique_id'] = existing_df.apply(create_unique_id, axis=1)
                     df['_unique_id'] = df.apply(create_unique_id, axis=1)
@@ -605,7 +1077,6 @@ class MetaActivityTrackerWithAirtable:
                         print(f"   - Final total: {len(combined_df)} rows")
                         df = combined_df
                         
-                        # Log new activities
                         if new_activities_count > 0:
                             newest_timestamp = new_df['Timestamp'].max()
                             oldest_timestamp = new_df['Timestamp'].min()
@@ -648,13 +1119,14 @@ class MetaActivityTrackerWithAirtable:
         except Exception as e:
             print(f"❌ Upload failed: {e}")
 
-    # ============ UPDATED run() METHOD ============
     def run(self, hours=24, append_mode=False, save_csv=False):
-        """Main execution pipeline with smart fetching"""
+        """Main execution pipeline with COMPLETE hierarchy building"""
         start_time = time.time()
         
         print("="*80)
-        print("META ACTIVITY TRACKER WITH AIRTABLE MAPPING")
+        print("🗂️ ENHANCED META ACTIVITY TRACKER - COMPLETE HIERARCHY")
+        print("Campaign → AdSet → Ad | Full Details | Human Activities Only")
+        print("="*80)
         print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Initial hours parameter: {hours}")
         print(f"Mode: {'APPEND' if append_mode else 'REPLACE'}")
@@ -687,7 +1159,7 @@ class MetaActivityTrackerWithAirtable:
                 print(f"\nℹ️ No previous data found, using default: {hours} hours\n")
                 self.log_github_activity('📋 First Run', f'Fetching last {hours} hours')
         
-        self.log_github_activity('🚀 Tracker Started', f'Fetching last {hours} hours')
+        self.log_github_activity('🚀 Tracker Started', f'Fetching last {hours} hours with complete hierarchy')
         
         self.brand_mapping_df = self.fetch_airtable_data()
         activities_df = self.fetch_meta_activities(hours=hours)
@@ -704,13 +1176,18 @@ class MetaActivityTrackerWithAirtable:
         else:
             time_range = 'N/A'
         
+        # Summary
         print("\n" + "="*80)
-        print("ACTIVITY SUMMARY")
+        print("📊 COMPLETE HIERARCHY SUMMARY")
         print("="*80)
         print(f"Total activities: {len(final_df)}")
         print(f"Unique brands: {final_df['Brand'].nunique()}")
         print(f"Unique actors: {final_df['Actor'].nunique()}")
         print(f"Time range: {time_range}")
+        
+        print("\n📊 Activity Distribution by Hierarchy Level:")
+        if 'Hierarchy_Level' in final_df.columns:
+            print(final_df['Hierarchy_Level'].value_counts())
         
         print("\n📊 Top 10 Most Active Brands:")
         print(final_df['Brand'].value_counts().head(10))
@@ -718,22 +1195,61 @@ class MetaActivityTrackerWithAirtable:
         print("\n📊 Top 10 Most Active People:")
         print(final_df['Actor'].value_counts().head(10))
         
-        print("\n📊 Activity Types:")
-        print(final_df['Action'].value_counts().head(10))
+        # Data completeness report
+        print("\n" + "="*80)
+        print("📈 DATA COMPLETENESS REPORT")
+        print("="*80)
+        
+        campaign_populated = final_df[final_df['Campaign_Name'] != 'N/A'].shape[0]
+        adset_populated = final_df[final_df['AdSet_Name'] != 'N/A'].shape[0]
+        ad_populated = final_df[final_df['Ad_Name'] != 'N/A'].shape[0]
+        
+        print(f"✅ Campaign data: {campaign_populated}/{len(final_df)} ({campaign_populated/len(final_df)*100:.1f}%)")
+        print(f"✅ AdSet data: {adset_populated}/{len(final_df)} ({adset_populated/len(final_df)*100:.1f}%)")
+        print(f"✅ Ad data: {ad_populated}/{len(final_df)} ({ad_populated/len(final_df)*100:.1f}%)")
+        
+        # Show sample hierarchy
+        print("\n" + "="*80)
+        print("🌳 SAMPLE COMPLETE HIERARCHIES")
+        print("="*80)
+        
+        for level in ['ADSET', 'AD']:
+            sample = final_df[final_df['Hierarchy_Level'] == level].head(1)
+            if not sample.empty:
+                row = sample.iloc[0]
+                print(f"\n{level} Activity Example:")
+                print(f"  Actor: {row.get('Actor', 'N/A')}")
+                print(f"  Action: {row.get('Action', 'N/A')}")
+                print(f"  📁 Campaign: {row.get('Campaign_Name', 'N/A')}")
+                print(f"     ├─ Objective: {row.get('Campaign_Objective', 'N/A')}")
+                print(f"     └─ Budget: {row.get('Campaign_Budget', 'N/A')}")
+                if level in ['ADSET', 'AD']:
+                    print(f"  📊 AdSet: {row.get('AdSet_Name', 'N/A')}")
+                    print(f"     ├─ Optimization: {row.get('AdSet_Optimization_Goal', 'N/A')}")
+                    print(f"     └─ Targeting: {row.get('Gender_Targeting', 'N/A')}, {row.get('Age_Targeting', 'N/A')}")
+                if level == 'AD':
+                    print(f"  🎨 Ad: {row.get('Ad_Name', 'N/A')}")
+                    print(f"     └─ Status: {row.get('Ad_Status', 'N/A')}")
         
         if save_csv:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            csv_file = f"meta_activities_{timestamp}.csv"
+            csv_file = f"meta_activities_COMPLETE_HIERARCHY_{timestamp}.csv"
             final_df.to_csv(csv_file, index=False)
-            print(f"\n💾 Saved to: {csv_file}")
+            print(f"\n💾 CSV SAVED: {csv_file}")
+            print(f"   Total rows: {len(final_df)}")
+            print(f"   Total columns: {len(final_df.columns)}")
         
         if self.gspread_client:
             self.upload_to_sheets(final_df, append_mode=append_mode)
             duration = (time.time() - start_time) / 60
             self.log_github_activity(
                 '✅ Tracker Completed',
-                f'{len(final_df)} activities in {duration:.1f}min. Range: {time_range}'
+                f'{len(final_df)} activities with complete hierarchy in {duration:.1f}min. Range: {time_range}'
             )
+        
+        print("\n" + "="*80)
+        print("✅ COMPLETE - Full hierarchy data available!")
+        print("="*80)
         
         return final_df
 
@@ -743,10 +1259,9 @@ if __name__ == "__main__":
     import sys
     
     print("\n" + "="*80)
-    print("🚀 META ACTIVITY TRACKER - GITHUB ACTIONS")
+    print("🚀 META ACTIVITY TRACKER - GITHUB ACTIONS (ENHANCED)")
     print("="*80)
     
-    # Get environment variables
     META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
     AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
     AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
@@ -754,7 +1269,6 @@ if __name__ == "__main__":
     GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "google_credentials.json")
     GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 
-    # Validate required variables
     missing_vars = []
     if not META_ACCESS_TOKEN:
         missing_vars.append("META_ACCESS_TOKEN")
@@ -774,7 +1288,6 @@ if __name__ == "__main__":
         print("\n💡 Make sure all GitHub Secrets are added!")
         sys.exit(1)
     
-    # Get hours from command line or default
     hours = 12
     if len(sys.argv) > 1:
         try:
@@ -788,29 +1301,30 @@ if __name__ == "__main__":
     print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"   Credentials: {GOOGLE_CREDENTIALS_PATH}")
     print(f"   Sheet ID: {GOOGLE_SPREADSHEET_ID[:20]}...")
+    print(f"   Mode: Complete Hierarchy Building")
     print("="*80 + "\n")
     
     try:
-        # Create tracker instance
-        tracker = MetaActivityTrackerWithAirtable(
+        tracker = EnhancedMetaActivityTrackerWithAirtable(
             meta_access_token=META_ACCESS_TOKEN,
             airtable_token=AIRTABLE_TOKEN,
             airtable_base_id=AIRTABLE_BASE_ID,
             airtable_table_name=AIRTABLE_TABLE_NAME,
             google_credentials_path=GOOGLE_CREDENTIALS_PATH,
             google_spreadsheet_id=GOOGLE_SPREADSHEET_ID,
-            max_workers=5
+            max_workers=5,
+            debug_mode=True  # Enable for detailed hierarchy building logs
         )
         
-        # Run tracker with SMART FETCH enabled (append_mode=True)
+        # Run with SMART FETCH and COMPLETE HIERARCHY enabled
         results = tracker.run(hours=hours, append_mode=True, save_csv=False)
         
-        # Success summary
         print("\n" + "="*80)
         print("✅ TRACKER COMPLETED SUCCESSFULLY! 🎉")
         print("="*80)
         print(f"   Activities processed: {len(results)}")
         print(f"   Unique brands: {results['Brand'].nunique() if not results.empty else 0}")
+        print(f"   Complete hierarchy built: Campaign → AdSet → Ad")
         print(f"   Data saved to Google Sheets")
         print("="*80 + "\n")
         
@@ -826,3 +1340,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("="*80 + "\n")
         sys.exit(1)
+
