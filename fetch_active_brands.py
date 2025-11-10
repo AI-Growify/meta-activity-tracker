@@ -302,7 +302,7 @@ class EnhancedMetaActivityTrackerWithAirtable:
         print(f"✅ Found {len(accounts)} Meta ad accounts")
         return accounts
 
-    def get_account_activities(self, ad_account_id, hours=24):
+    def get_account_activities(self, ad_account_id, hours=228):
         """Get activities for an account from last N hours"""
         since_dt = datetime.now() - timedelta(hours=hours)
         since_iso = since_dt.strftime('%Y-%m-%dT%H:%M:%S')
@@ -656,7 +656,7 @@ class EnhancedMetaActivityTrackerWithAirtable:
         
         return hierarchy
 
-    def _process_account(self, account, hours=24):
+    def _process_account(self, account, hours=228):
         """Process one account - get activities with COMPLETE hierarchy"""
         account_id = account.get('id')
         account_name = account.get('name', 'Unknown')
@@ -729,7 +729,7 @@ class EnhancedMetaActivityTrackerWithAirtable:
         
         return results
 
-    def fetch_meta_activities(self, hours=24):
+    def fetch_meta_activities(self, hours=228):
         """Fetch all activities from all accounts in parallel"""
         print("\n" + "="*80)
         print(f"FETCHING META ACTIVITIES WITH COMPLETE HIERARCHY (Last {hours} hours)")
@@ -1119,7 +1119,7 @@ class EnhancedMetaActivityTrackerWithAirtable:
         except Exception as e:
             print(f"❌ Upload failed: {e}")
 
-    def run(self, hours=24, append_mode=False, save_csv=False):
+    def run(self, hours=228, append_mode=False, save_csv=False):
         """Main execution pipeline with COMPLETE hierarchy building"""
         start_time = time.time()
         
@@ -1340,4 +1340,5 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("="*80 + "\n")
         sys.exit(1)
+
 
