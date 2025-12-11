@@ -19,9 +19,6 @@ load_dotenv()
 
 
 class EnhancedMetaActivityTrackerWithAirtable:
-    """Enhanced Meta activity tracker with COMPLETE HIERARCHY + Airtable mapping"""
-    
-    # Activities to EXCLUDE (Meta's automated actions)
     EXCLUDED_EVENT_TYPES = {
         'ad_account_update_spend_limit',
         'ad_account_reset_spend_limit',
@@ -82,8 +79,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
             'skipped_objects': [],
             'hierarchy_errors': []
         }
-
-    # ------------------ HTTP / META HELPERS ------------------ #
 
     def _create_session_with_retries(self):
         session = requests.Session()
@@ -193,8 +188,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
         
         return False
 
-    # ------------------ BRAND / AIRTABLE HELPERS ------------------ #
-
     def _normalize_brand_name(self, name):
         """Normalize brand name for matching"""
         if pd.isna(name) or not name:
@@ -277,8 +270,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
         print(f"   Columns: {', '.join(df.columns.tolist())}")
         
         return df
-
-    # ------------------ META FETCHING ------------------ #
 
     def get_all_ad_accounts(self):
         """Get all Meta ad accounts"""
@@ -469,8 +460,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
             return str(old_value), str(new_value)
         except:
             return 'N/A', 'N/A'
-
-    # ------------------ HIERARCHY BUILD ------------------ #
 
     def _build_complete_hierarchy(self, activity):
         """
@@ -664,8 +653,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
         
         return hierarchy
 
-    # ------------------ ACCOUNT PROCESSING ------------------ #
-
     def _process_account(self, account, hours=24):
         """Process one account - get activities with COMPLETE hierarchy"""
         account_id = account.get('id')
@@ -824,8 +811,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
         
         return df
 
-    # ------------------ AIRTABLE → ACTIVITIES MAPPING ------------------ #
-
     def map_airtable_to_activities(self, activities_df):
         """Map Airtable brand data to Meta activities with fuzzy matching"""
         print("\n" + "="*80)
@@ -930,14 +915,8 @@ class EnhancedMetaActivityTrackerWithAirtable:
         
         return activities_df
 
-    # ------------------ SHEETS / LOGGING ------------------ #
-
     def get_last_entry_time_from_sheet(self):
-        """Get the most recent fetch time from existing Google Sheet data.
-
-        Prefer Fetch_Date (when the row was written) and fall back to Timestamp
-        if Fetch_Date is not available.
-        """
+        """Get the most recent timestamp from existing Google Sheet data"""
         if self.gspread_client is None:
             return None
         
@@ -951,30 +930,24 @@ class EnhancedMetaActivityTrackerWithAirtable:
                 return None
             
             df = pd.DataFrame(data)
-
-            # Prefer Fetch_Date (monotonic per run), else fall back to Timestamp
-            if 'Fetch_Date' in df.columns:
-                date_col = 'Fetch_Date'
-            elif 'Timestamp' in df.columns:
-                date_col = 'Timestamp'
-            else:
-                print("⚠️ No Fetch_Date or Timestamp column found")
-                return None
-
-            df = df[df[date_col].notna() & (df[date_col] != '')]
-            if df.empty:
-                print("⚠️ No valid dates found")
+            
+            if 'Timestamp' not in df.columns:
+                print("⚠️ No Timestamp column found")
                 return None
             
-            df['__dt'] = pd.to_datetime(df[date_col], errors='coerce')
-            df = df.dropna(subset=['__dt'])
+            df = df[df['Timestamp'].notna() & (df['Timestamp'] != '')]
+            if df.empty:
+                print("⚠️ No valid timestamps found")
+                return None
+            
+            df['Timestamp_dt'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+            df = df.dropna(subset=['Timestamp_dt'])
             
             if df.empty:
-                print("⚠️ No parsable dates found")
                 return None
             
-            last_timestamp = df['__dt'].max()
-            print(f"📅 Last entry in sheet ({date_col}): {last_timestamp}")
+            last_timestamp = df['Timestamp_dt'].max()
+            print(f"📅 Last entry in sheet: {last_timestamp}")
             return last_timestamp
             
         except Exception as e:
@@ -1143,8 +1116,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
         except Exception as e:
             print(f"❌ Upload failed: {e}")
 
-    # ------------------ MAIN PIPELINE (WITH SAFETY LAYER) ------------------ #
-
     def run(self, hours=24, append_mode=False, save_csv=False):
         """Main execution pipeline with COMPLETE hierarchy building"""
         start_time = time.time()
@@ -1157,10 +1128,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
         print(f"Initial hours parameter: {hours}")
         print(f"Mode: {'APPEND' if append_mode else 'REPLACE'}")
         print("="*80)
-
-        # Safety limits for smart fetch
-        MAX_HOURS = 48   # never fetch more than this many hours
-        MIN_HOURS = 6    # always fetch at least this many hours
         
         # SMART FETCH: Calculate actual hours needed
         if append_mode:
@@ -1169,18 +1136,13 @@ class EnhancedMetaActivityTrackerWithAirtable:
             if last_entry_time:
                 now = datetime.now()
                 hours_since_last = (now - last_entry_time).total_seconds() / 3600
-                raw_adjusted_hours = int(hours_since_last) + 2
-
-                # Clamp to safety bounds
-                adjusted_hours = max(MIN_HOURS, min(raw_adjusted_hours, MAX_HOURS))
+                adjusted_hours = int(hours_since_last) + 2
                 
                 print(f"\n🔍 SMART FETCH CALCULATION:")
                 print(f"   Last entry time: {last_entry_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"   Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"   Hours since last entry: {hours_since_last:.2f}")
-                print(f"   Raw adjusted window: {raw_adjusted_hours} hours (+2h buffer)")
-                print(f"   ✅ Final capped window: {adjusted_hours} hours "
-                      f"(min={MIN_HOURS}, max={MAX_HOURS})")
+                print(f"   Adjusted fetch window: {adjusted_hours} hours (with 2h buffer)")
                 print("="*80 + "\n")
                 
                 hours = adjusted_hours
@@ -1188,8 +1150,7 @@ class EnhancedMetaActivityTrackerWithAirtable:
                 self.log_github_activity(
                     '🔍 Smart Fetch Calculated',
                     f'Last: {last_entry_time.strftime("%Y-%m-%d %H:%M:%S")}, '
-                    f'Gap: {hours_since_last:.1f}h, '
-                    f'Fetching: {hours}h (raw={raw_adjusted_hours}h, max={MAX_HOURS}h)'
+                    f'Gap: {hours_since_last:.1f}h, Fetching: {adjusted_hours}h'
                 )
             else:
                 print(f"\nℹ️ No previous data found, using default: {hours} hours\n")
@@ -1291,7 +1252,6 @@ class EnhancedMetaActivityTrackerWithAirtable:
 
 
 # ============ MAIN ============
-
 if __name__ == "__main__":
     import sys
     
@@ -1377,4 +1337,3 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("="*80 + "\n")
         sys.exit(1)
-        
