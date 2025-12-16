@@ -807,6 +807,44 @@ class UltraFastMetaActivityTracker:
         except:
             return pd.DataFrame()
 
+    def log_github_activity(self, action, details):
+        """Log activities to GitHub Actions Log sheet"""
+        if self.gspread_client is None:
+            return
+        
+        try:
+            sh = self.gspread_client.open_by_key(self.google_spreadsheet_id)
+            
+            try:
+                ws = sh.worksheet('GitHub_Actions_Log')
+            except:
+                ws = sh.add_worksheet(title='GitHub_Actions_Log', rows=1000, cols=10)
+                ws.append_row([
+                    'Timestamp', 'Run Number', 'Action', 'Details', 
+                    'Activities Count', 'Time Range', 'Status'
+                ])
+                ws.format('1:1', {
+                    'textFormat': {'bold': True, 'fontSize': 11},
+                    'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.2},
+                    'horizontalAlignment': 'CENTER'
+                })
+            
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            run_number = os.getenv('GITHUB_RUN_NUMBER', 'manual')
+            
+            ws.append_row([
+                timestamp,
+                run_number,
+                action,
+                details,
+                '',
+                '',
+                '✅ Success' if 'Success' in action or 'Completed' in action else '🔄 In Progress'
+            ])
+            
+        except Exception as e:
+            print(f"⚠️ Could not log to GitHub Actions sheet: {e}")
+
     def upload_to_sheets(self, df, sheet='Meta_Activities_Log', append_mode=False):
         """Upload to Google Sheets with deduplication"""
         if not self.gspread_client or df.empty:
@@ -816,6 +854,8 @@ class UltraFastMetaActivityTracker:
         
         try:
             sh = self.gspread_client.open_by_key(self.google_spreadsheet_id)
+            
+            new_activities_count = 0
             
             if append_mode:
                 existing = self.read_existing_data_from_sheets(sheet)
@@ -828,13 +868,23 @@ class UltraFastMetaActivityTracker:
                     
                     existing_ids = set(existing['_uid'])
                     new_df = df[~df['_uid'].isin(existing_ids)].copy()
+                    new_activities_count = len(new_df)
                     
-                    print(f"   Existing: {len(existing)}, New fetch: {len(df)}, Truly new: {len(new_df)}")
+                    print(f"   Existing: {len(existing)}, New fetch: {len(df)}, Truly new: {new_activities_count}")
                     
                     if len(new_df) > 0:
                         combined = pd.concat([existing, new_df], ignore_index=True)
                         combined = combined.drop('_uid', axis=1).sort_values('Timestamp', ascending=False)
                         df = combined
+                        
+                        # Log new activities added
+                        if new_activities_count > 0:
+                            newest_timestamp = new_df['Timestamp'].max()
+                            oldest_timestamp = new_df['Timestamp'].min()
+                            self.log_github_activity(
+                                f'➕ Added {new_activities_count} New Activities',
+                                f'Range: {oldest_timestamp} to {newest_timestamp}'
+                            )
                     else:
                         print("   ℹ️ No new activities")
                         df = existing.drop('_uid', axis=1)
@@ -849,7 +899,10 @@ class UltraFastMetaActivityTracker:
             ws.format('1:1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.2}})
             ws.freeze(rows=1)
             
-            print(f"✅ Uploaded {len(df)} rows\n🔗 https://docs.google.com/spreadsheets/d/{self.google_spreadsheet_id}")
+            print(f"✅ Uploaded {len(df)} rows")
+            if new_activities_count > 0:
+                print(f"   📊 {new_activities_count} NEW activities added")
+            print(f"🔗 https://docs.google.com/spreadsheets/d/{self.google_spreadsheet_id}")
         except Exception as e:
             print(f"❌ Upload failed: {e}")
 
@@ -873,12 +926,25 @@ class UltraFastMetaActivityTracker:
                 gap = (now - last).total_seconds() / 3600
                 hours = int(gap) + 2
                 print(f"\n🔍 SMART FETCH: Last={last.strftime('%Y-%m-%d %H:%M:%S')}, Gap={gap:.1f}h, Fetching={hours}h\n")
+                
+                # Log smart fetch calculation
+                self.log_github_activity(
+                    '🔍 Smart Fetch Calculated',
+                    f'Last: {last.strftime("%Y-%m-%d %H:%M:%S")}, Gap: {gap:.1f}h, Fetching: {hours}h'
+                )
+            else:
+                print(f"\nℹ️ No previous data found, using default: {hours} hours\n")
+                self.log_github_activity('📋 First Run', f'Fetching last {hours} hours')
+        
+        # Log tracker start
+        self.log_github_activity('🚀 Tracker Started', f'Ultra-fast mode: Fetching last {hours}h with batch API')
         
         self.brand_mapping_df = self.fetch_airtable_data()
         df = self.fetch_meta_activities(hours=hours)
         
         if df.empty:
             print("\n✅ No activities found")
+            self.log_github_activity('ℹ️ No New Activities', f'No activities in last {hours}h')
             return df
         
         final = self.map_airtable_to_activities(df)
@@ -900,6 +966,15 @@ class UltraFastMetaActivityTracker:
             self.upload_to_sheets(final, append_mode=append_mode)
         
         duration = (time.time() - start) / 60
+        
+        # Log tracker completion
+        if self.gspread_client:
+            self.log_github_activity(
+                '✅ Tracker Completed',
+                f'{len(final)} activities with batch API in {duration:.1f}min. '
+                f'Saved {self.debug_stats["batch_savings"]} API calls. Range: {time_range}'
+            )
+        
         print(f"\n{'='*80}\n⚡ COMPLETE in {duration:.1f}min (vs {duration*5:.1f}min without batch!)\n{'='*80}\n")
         
         return final
